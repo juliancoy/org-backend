@@ -1301,6 +1301,18 @@ async def _spicedb_check_admin(user_id: str) -> bool:
     data = resp.json()
     return data.get("permissionship") == "PERMISSIONSHIP_HAS_PERMISSION"
 
+
+def _ensure_network_ingest_schema() -> None:
+    """Apply lightweight online schema fixes required for calendar ingest."""
+    statements = [
+        "ALTER TABLE IF EXISTS network_events ADD COLUMN IF NOT EXISTS ingest_key VARCHAR(255)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_network_events_ingest_key ON network_events (ingest_key)",
+    ]
+    with db.engine.begin() as conn:
+        for statement in statements:
+            conn.execute(text(statement))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan manager for startup/shutdown"""
@@ -1309,6 +1321,11 @@ async def lifespan(app: FastAPI):
     # Create tables if they don't exist
     Base.metadata.create_all(bind=db.engine)
     logger.info("Database tables verified/created")
+    try:
+        _ensure_network_ingest_schema()
+        logger.info("Network ingest schema verified/updated")
+    except Exception as exc:
+        logger.warning(f"Network ingest schema migration skipped: {exc}")
     await ensure_ubi_runtime_settings_table()
     session = None
     try:
