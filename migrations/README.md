@@ -8,6 +8,7 @@ Adds LinkedIn-style network primitives:
 - `organization_memberships`
 - `user_contact_pages`
 - `organization_claim_requests`
+- `network_events`
 - `network_audit_events`
 
 Apply this migration before deploying org-backend changes in strict environments where `Base.metadata.create_all` is not used for schema management.

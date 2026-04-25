@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Request, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, validator, Field
@@ -15,6 +15,7 @@ import sys
 import asyncio
 import re
 import ast
+import secrets
 from pathlib import Path
 
 # Database imports
@@ -150,6 +151,12 @@ class VoteType(str, Enum):
     YES = "yes"
     NO = "no"
     ABSTAIN = "abstain"
+
+
+class EventHostType(str, Enum):
+    UNCLAIMED = "unclaimed"
+    INDIVIDUAL = "individual"
+    ORG = "org"
 
 class Account(Base):
     """Financial account for individuals, businesses, nonprofits, or government"""
@@ -541,6 +548,53 @@ class Organization(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
 
     memberships = relationship("OrganizationMembership", back_populates="organization", cascade="all, delete-orphan")
+    hosted_events = relationship("NetworkEvent", back_populates="host_org")
+
+
+class NetworkEvent(Base):
+    """Network event with explicit host binding and optional ownership claim."""
+    __tablename__ = "network_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    title = Column(String(255), nullable=False, index=True)
+    slug = Column(String(255), nullable=False, unique=True, index=True)
+    description = Column(Text)
+    starts_at = Column(DateTime(timezone=True), index=True)
+    ends_at = Column(DateTime(timezone=True))
+    location = Column(String(255), index=True)
+    source_url = Column(Text, unique=True, index=True)
+    ingest_key = Column(String(255), unique=True, index=True)
+    image_url = Column(Text)
+    tags = Column(JSONB)
+    host_type = Column(String(20), nullable=False, default=EventHostType.UNCLAIMED.value, index=True)
+    host_user_id = Column(String(255), index=True)
+    host_org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL"), index=True)
+    claimed_by_user_id = Column(String(255), index=True)
+    created_by_user_id = Column(String(255), index=True)
+    seeded_from_events = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "host_type IN ('unclaimed', 'individual', 'org')",
+            name="check_network_event_host_type",
+        ),
+        CheckConstraint(
+            "("
+            "(host_type = 'unclaimed' AND host_user_id IS NULL AND host_org_id IS NULL) OR "
+            "(host_type = 'individual' AND host_user_id IS NOT NULL AND host_org_id IS NULL) OR "
+            "(host_type = 'org' AND host_org_id IS NOT NULL AND host_user_id IS NULL)"
+            ")",
+            name="check_network_event_host_binding",
+        ),
+        CheckConstraint(
+            "(ends_at IS NULL OR starts_at IS NULL OR ends_at >= starts_at)",
+            name="check_network_event_time_range",
+        ),
+    )
+
+    host_org = relationship("Organization", back_populates="hosted_events")
 
 
 class OrganizationMembership(Base):
@@ -798,6 +852,7 @@ class OrganizationCreate(BaseModel):
     source_url: Optional[str] = None
     image_url: Optional[str] = None
     tags: Optional[List[str]] = None
+    claim_on_create: bool = True
 
 
 class OrganizationMembershipUpsert(BaseModel):
@@ -860,6 +915,93 @@ class OrganizationResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class NetworkEventCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    location: Optional[str] = Field(None, max_length=255)
+    source_url: Optional[str] = None
+    image_url: Optional[str] = None
+    tags: Optional[List[str]] = None
+    host_type: str = Field(EventHostType.UNCLAIMED.value, pattern="^(unclaimed|individual|org)$")
+    host_user_id: Optional[str] = Field(None, min_length=1, max_length=255)
+    host_org_id: Optional[uuid.UUID] = None
+    claim_on_create: bool = False
+
+
+class NetworkEventClaimRequest(BaseModel):
+    host_type: str = Field(..., pattern="^(individual|org)$")
+    host_user_id: Optional[str] = Field(None, min_length=1, max_length=255)
+    host_org_id: Optional[uuid.UUID] = None
+
+
+class NetworkEventResponse(BaseModel):
+    id: uuid.UUID
+    title: str
+    slug: str
+    description: Optional[str] = None
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    location: Optional[str] = None
+    source_url: Optional[str] = None
+    image_url: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    host_type: str
+    host_user_id: Optional[str] = None
+    host_org_id: Optional[uuid.UUID] = None
+    host_org_name: Optional[str] = None
+    claimed_by_user_id: Optional[str] = None
+    created_by_user_id: Optional[str] = None
+    seeded_from_events: bool
+    is_unclaimed: bool
+    my_host_role: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class CalendarIngestOrganization(BaseModel):
+    name: Optional[str] = Field(None, max_length=255)
+    source_url: Optional[str] = None
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    city: Optional[str] = Field(None, max_length=64)
+
+
+class CalendarIngestEvent(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    location: Optional[str] = Field(None, max_length=255)
+    source_url: Optional[str] = None
+    host_org_source_url: Optional[str] = None
+    image_url: Optional[str] = None
+    tags: Optional[List[str]] = None
+    city: Optional[str] = Field(None, max_length=64)
+    ingest_key: Optional[str] = Field(None, max_length=255)
+
+
+class CalendarIngestPayload(BaseModel):
+    source: Optional[str] = Field("genCalendar", max_length=120)
+    run_id: Optional[str] = Field(None, max_length=255)
+    generated_at: Optional[datetime] = None
+    organizations: List[CalendarIngestOrganization] = Field(default_factory=list)
+    events: List[CalendarIngestEvent] = Field(default_factory=list)
+
+
+class CalendarIngestResponse(BaseModel):
+    organizations_inserted: int
+    organizations_updated: int
+    events_inserted: int
+    events_updated: int
+    events_skipped: int
 
 
 class SeedOrganizationsResponse(BaseModel):
@@ -1310,6 +1452,16 @@ def _ensure_unique_org_slug(session: Session, preferred: str) -> str:
     return candidate
 
 
+def _ensure_unique_event_slug(session: Session, preferred: str) -> str:
+    base = _slugify(preferred)
+    candidate = base
+    counter = 2
+    while session.query(NetworkEvent).filter(NetworkEvent.slug == candidate).first():
+        candidate = f"{base}-{counter}"
+        counter += 1
+    return candidate
+
+
 def _ensure_unique_contact_slug(session: Session, preferred: str, excluding_user_id: Optional[str] = None) -> str:
     base = _slugify(preferred)
     candidate = base
@@ -1345,6 +1497,295 @@ def _map_org(org: Organization, current_user_id: Optional[str] = None) -> Organi
         created_at=org.created_at,
         updated_at=org.updated_at,
     )
+
+
+def _map_network_event(event: NetworkEvent, current_user: Optional[dict], session: Session) -> NetworkEventResponse:
+    user_id = _actor_user_id(current_user or {})
+    my_host_role = None
+
+    if user_id:
+        if event.claimed_by_user_id == user_id:
+            my_host_role = "owner"
+        elif event.host_type == EventHostType.INDIVIDUAL.value and event.host_user_id == user_id:
+            my_host_role = "host_individual"
+        elif event.host_type == EventHostType.ORG.value and event.host_org_id:
+            org = session.query(Organization).filter(Organization.id == event.host_org_id).first()
+            if org and _is_org_admin(org, current_user or {}):
+                my_host_role = "host_org_admin"
+
+    host_org_name = None
+    if event.host_type == EventHostType.ORG.value and event.host_org_id:
+        host_org = session.query(Organization).filter(Organization.id == event.host_org_id).first()
+        if host_org:
+            host_org_name = host_org.name
+
+    return NetworkEventResponse(
+        id=event.id,
+        title=event.title,
+        slug=event.slug,
+        description=event.description,
+        starts_at=event.starts_at,
+        ends_at=event.ends_at,
+        location=event.location,
+        source_url=event.source_url,
+        image_url=event.image_url,
+        tags=list(event.tags or []),
+        host_type=event.host_type,
+        host_user_id=event.host_user_id,
+        host_org_id=event.host_org_id,
+        host_org_name=host_org_name,
+        claimed_by_user_id=event.claimed_by_user_id,
+        created_by_user_id=event.created_by_user_id,
+        seeded_from_events=bool(event.seeded_from_events),
+        is_unclaimed=event.claimed_by_user_id is None,
+        my_host_role=my_host_role,
+        created_at=event.created_at,
+        updated_at=event.updated_at,
+    )
+
+
+def _resolve_event_host_binding(
+    *,
+    host_type: str,
+    host_user_id: Optional[str],
+    host_org_id: Optional[uuid.UUID],
+    current_user: dict,
+    session: Session,
+) -> tuple[str, Optional[str], Optional[uuid.UUID]]:
+    user_id = _actor_user_id(current_user)
+    normalized_type = host_type.strip().lower()
+    normalized_user_id = host_user_id.strip() if host_user_id else None
+
+    if normalized_type == EventHostType.UNCLAIMED.value:
+        if normalized_user_id or host_org_id:
+            raise HTTPException(status_code=422, detail="Unclaimed host type cannot include host_user_id or host_org_id")
+        return EventHostType.UNCLAIMED.value, None, None
+
+    if normalized_type == EventHostType.INDIVIDUAL.value:
+        if host_org_id:
+            raise HTTPException(status_code=422, detail="Individual host type cannot include host_org_id")
+        target_user_id = normalized_user_id or user_id
+        if not target_user_id:
+            raise HTTPException(status_code=401, detail="Authentication required for individual host")
+        if target_user_id != user_id and not current_user.get("is_admin"):
+            raise HTTPException(status_code=403, detail="Cannot assign event to a different user")
+        return EventHostType.INDIVIDUAL.value, target_user_id, None
+
+    if normalized_type == EventHostType.ORG.value:
+        if normalized_user_id:
+            raise HTTPException(status_code=422, detail="Org host type cannot include host_user_id")
+        if not host_org_id:
+            raise HTTPException(status_code=422, detail="host_org_id is required when host_type='org'")
+        org = session.query(Organization).filter(Organization.id == host_org_id).first()
+        if not org:
+            raise HTTPException(status_code=404, detail="Host organization not found")
+        if not _is_org_admin(org, current_user):
+            raise HTTPException(status_code=403, detail="Organization admin access required for org-hosted events")
+        return EventHostType.ORG.value, None, host_org_id
+
+    raise HTTPException(status_code=422, detail="Unsupported host_type")
+
+
+def _extract_bearer_token(authorization: Optional[str]) -> str:
+    if not authorization:
+        return ""
+    value = authorization.strip()
+    if not value.lower().startswith("bearer "):
+        return ""
+    return value.split(" ", 1)[1].strip()
+
+
+def _require_ingest_auth(request: Request) -> None:
+    expected = (os.getenv("ORG_INGEST_TOKEN") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Ingest token is not configured")
+    provided = (
+        request.headers.get("x-org-ingest-token")
+        or _extract_bearer_token(request.headers.get("authorization"))
+    )
+    if not provided or not secrets.compare_digest(provided.strip(), expected):
+        raise HTTPException(status_code=401, detail="Invalid ingest token")
+
+
+def _normalize_ingest_url(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if not re.match(r"^https?://", cleaned, flags=re.IGNORECASE):
+        return None
+    return cleaned
+
+
+def _clean_ingest_tags(tags: Optional[List[str]], city: Optional[str] = None) -> List[str]:
+    cleaned: list[str] = []
+    for tag in tags or []:
+        item = str(tag or "").strip()
+        if item:
+            cleaned.append(item)
+    if city:
+        cleaned.append(f"city:{city.strip().lower()}")
+    return sorted(set(cleaned))
+
+
+def _derive_org_name(source_url: Optional[str], fallback: Optional[str] = None) -> str:
+    preferred = str(fallback or "").strip()
+    if preferred:
+        return preferred
+    source = _normalize_ingest_url(source_url)
+    if source:
+        host = source.split("://", 1)[1].split("/", 1)[0]
+        host = host.replace("www.", "")
+        return host
+    return "Organization"
+
+
+def _build_ingest_event_key(item: CalendarIngestEvent) -> str:
+    if item.ingest_key and item.ingest_key.strip():
+        return item.ingest_key.strip()
+    material = "|".join(
+        [
+            str(item.city or "").strip().lower(),
+            str(item.host_org_source_url or "").strip().lower(),
+            str(item.source_url or "").strip().lower(),
+            str(item.title or "").strip().lower(),
+            item.starts_at.isoformat() if item.starts_at else "",
+            item.ends_at.isoformat() if item.ends_at else "",
+            str(item.location or "").strip().lower(),
+        ]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _upsert_ingested_organization(
+    session: Session,
+    item: CalendarIngestOrganization,
+) -> tuple[Organization, bool]:
+    source_url = _normalize_ingest_url(item.source_url)
+    name = _derive_org_name(source_url, item.name)
+    tags = _clean_ingest_tags(item.tags, item.city)
+    image_url = _normalize_ingest_url(item.image_url)
+    description = (item.description or "").strip() or None
+
+    org = None
+    if source_url:
+        org = session.query(Organization).filter(Organization.source_url == source_url).first()
+    if not org:
+        candidate_slug = _slugify(name)
+        org = session.query(Organization).filter(Organization.slug == candidate_slug).first()
+
+    created = False
+    if not org:
+        org = Organization(
+            id=uuid.uuid4(),
+            name=name,
+            slug=_ensure_unique_org_slug(session, name),
+            description=description,
+            source_url=source_url,
+            image_url=image_url,
+            tags=tags,
+            seeded_from_events=True,
+        )
+        session.add(org)
+        created = True
+    else:
+        if not org.claimed_by_user_id:
+            org.name = name
+            if description:
+                org.description = description
+        if source_url and not org.source_url:
+            org.source_url = source_url
+        if image_url:
+            org.image_url = image_url
+        if tags:
+            merged_tags = sorted(set((org.tags or []) + tags))
+            org.tags = merged_tags
+        org.seeded_from_events = True
+        org.updated_at = datetime.now(timezone.utc)
+    return org, created
+
+
+def _upsert_ingested_event(
+    session: Session,
+    item: CalendarIngestEvent,
+    host_org_by_source: Dict[str, Organization],
+) -> tuple[Optional[NetworkEvent], str]:
+    if item.ends_at and item.starts_at and item.ends_at < item.starts_at:
+        return None, "skipped"
+
+    ingest_key = _build_ingest_event_key(item)
+    source_url = _normalize_ingest_url(item.source_url)
+    host_org_source_url = _normalize_ingest_url(item.host_org_source_url)
+    image_url = _normalize_ingest_url(item.image_url)
+    tags = _clean_ingest_tags(item.tags, item.city)
+
+    host_org = host_org_by_source.get(host_org_source_url or "")
+    title = item.title.strip()
+    if not title:
+        return None, "skipped"
+
+    event = session.query(NetworkEvent).filter(NetworkEvent.ingest_key == ingest_key).first()
+    if not event and source_url and item.starts_at:
+        event = (
+            session.query(NetworkEvent)
+            .filter(
+                NetworkEvent.source_url == source_url,
+                NetworkEvent.title == title,
+                NetworkEvent.starts_at == item.starts_at,
+            )
+            .first()
+        )
+
+    created = False
+    if not event:
+        event = NetworkEvent(
+            id=uuid.uuid4(),
+            title=title,
+            slug=_ensure_unique_event_slug(session, f"{title}-{item.starts_at.date()}" if item.starts_at else title),
+            description=(item.description or "").strip() or None,
+            starts_at=item.starts_at,
+            ends_at=item.ends_at,
+            location=(item.location or "").strip() or None,
+            source_url=source_url,
+            ingest_key=ingest_key,
+            image_url=image_url,
+            tags=tags,
+            host_type=EventHostType.ORG.value if host_org else EventHostType.UNCLAIMED.value,
+            host_org_id=host_org.id if host_org else None,
+            host_user_id=None,
+            claimed_by_user_id=None,
+            seeded_from_events=True,
+        )
+        session.add(event)
+        created = True
+    else:
+        event.ingest_key = event.ingest_key or ingest_key
+        event.title = title
+        event.description = (item.description or "").strip() or None
+        event.starts_at = item.starts_at
+        event.ends_at = item.ends_at
+        event.location = (item.location or "").strip() or None
+        if source_url and source_url != event.source_url:
+            existing_source_owner = (
+                session.query(NetworkEvent)
+                .filter(NetworkEvent.source_url == source_url, NetworkEvent.id != event.id)
+                .first()
+            )
+            if not existing_source_owner:
+                event.source_url = source_url
+        if image_url:
+            event.image_url = image_url
+        if tags:
+            event.tags = sorted(set((event.tags or []) + tags))
+        if host_org and not event.claimed_by_user_id:
+            event.host_type = EventHostType.ORG.value
+            event.host_org_id = host_org.id
+            event.host_user_id = None
+        event.seeded_from_events = True
+        event.updated_at = datetime.now(timezone.utc)
+
+    return event, "created" if created else "updated"
 
 
 def _validate_public_url(url: Optional[str], field_name: str) -> Optional[str]:
@@ -1595,6 +2036,69 @@ class EconomicEngine:
 
 # ============= ORG NETWORK ENDPOINTS =============
 
+@app.post("/api/network/ingest/calendar", response_model=CalendarIngestResponse)
+async def ingest_calendar_feed(
+    payload: CalendarIngestPayload,
+    request: Request,
+    session: Session = Depends(get_db),
+):
+    _require_ingest_auth(request)
+    _throttle_action("network:ingest:calendar", limit=120, window_seconds=3600)
+
+    org_inserted = 0
+    org_updated = 0
+    event_inserted = 0
+    event_updated = 0
+    event_skipped = 0
+
+    host_org_by_source: Dict[str, Organization] = {}
+    for item in payload.organizations:
+        org, created = _upsert_ingested_organization(session, item)
+        source_url = _normalize_ingest_url(item.source_url)
+        if source_url:
+            host_org_by_source[source_url] = org
+        if created:
+            org_inserted += 1
+        else:
+            org_updated += 1
+
+    for item in payload.events:
+        source_url = _normalize_ingest_url(item.host_org_source_url)
+        if source_url and source_url not in host_org_by_source:
+            fallback_org, created = _upsert_ingested_organization(
+                session,
+                CalendarIngestOrganization(
+                    source_url=source_url,
+                    name=None,
+                    city=item.city,
+                    tags=item.tags or [],
+                ),
+            )
+            host_org_by_source[source_url] = fallback_org
+            if created:
+                org_inserted += 1
+            else:
+                org_updated += 1
+
+        event, status_label = _upsert_ingested_event(session, item, host_org_by_source)
+        if event is None and status_label == "skipped":
+            event_skipped += 1
+            continue
+        if status_label == "created":
+            event_inserted += 1
+        elif status_label == "updated":
+            event_updated += 1
+
+    session.commit()
+    return CalendarIngestResponse(
+        organizations_inserted=org_inserted,
+        organizations_updated=org_updated,
+        events_inserted=event_inserted,
+        events_updated=event_updated,
+        events_skipped=event_skipped,
+    )
+
+
 @app.get("/api/network/seed", response_model=SeedOrganizationsResponse)
 async def seed_organizations(
     force_update: bool = False,
@@ -1665,26 +2169,27 @@ async def create_organization(
         image_url=_validate_public_url(payload.image_url, "image_url"),
         tags=payload.tags or [],
         seeded_from_events=False,
-        claimed_by_user_id=user_id,
+        claimed_by_user_id=user_id if payload.claim_on_create else None,
         created_by_user_id=user_id,
     )
     session.add(org)
-    membership = OrganizationMembership(
-        id=uuid.uuid4(),
-        organization=org,
-        user_id=user_id,
-        user_email=current_user.get("email"),
-        user_name=current_user.get("name"),
-        role="admin",
-    )
-    session.add(membership)
+    if payload.claim_on_create:
+        membership = OrganizationMembership(
+            id=uuid.uuid4(),
+            organization=org,
+            user_id=user_id,
+            user_email=current_user.get("email"),
+            user_name=current_user.get("name"),
+            role="admin",
+        )
+        session.add(membership)
     _audit_event(
         session,
         actor=current_user,
         event_type="org.created",
         target_type="organization",
         target_id=str(org.id),
-        metadata={"slug": org.slug, "name": org.name},
+        metadata={"slug": org.slug, "name": org.name, "claim_on_create": payload.claim_on_create},
     )
     session.commit()
     session.refresh(org)
@@ -1742,6 +2247,238 @@ async def claim_organization(
     session.commit()
     session.refresh(org)
     return _map_org(org, user_id)
+
+
+@app.post("/api/network/orgs/{organization_id}/unclaim", response_model=OrganizationResponse)
+async def unclaim_organization(
+    organization_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user)
+    org = session.query(Organization).filter(Organization.id == organization_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if org.claimed_by_user_id is None:
+        return _map_org(org, user_id)
+    if not current_user.get("is_admin") and org.claimed_by_user_id != user_id:
+        raise HTTPException(status_code=403, detail="Only the claiming user or an admin can unclaim this organization")
+
+    previous_owner = org.claimed_by_user_id
+    org.claimed_by_user_id = None
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="org.unclaimed",
+        target_type="organization",
+        target_id=str(org.id),
+        metadata={"previous_owner": previous_owner},
+    )
+    session.commit()
+    session.refresh(org)
+    return _map_org(org, user_id)
+
+
+@app.get("/api/network/events", response_model=List[NetworkEventResponse])
+async def list_network_events(
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+    q: str = "",
+    mine: bool = False,
+    only_unclaimed: bool = False,
+    host_type: Optional[str] = None,
+    limit: int = 250,
+    offset: int = 0,
+):
+    _require_authenticated_user(current_user)
+    safe_limit = max(1, min(limit, 1000))
+    safe_offset = max(0, min(offset, 100000))
+    query = session.query(NetworkEvent).order_by(NetworkEvent.starts_at.desc().nullslast(), NetworkEvent.created_at.desc())
+    if q.strip():
+        needle = f"%{q.strip()}%"
+        query = query.filter(
+            (NetworkEvent.title.ilike(needle))
+            | (NetworkEvent.slug.ilike(needle))
+            | (NetworkEvent.location.ilike(needle))
+        )
+    if only_unclaimed:
+        query = query.filter(NetworkEvent.claimed_by_user_id.is_(None))
+    if host_type and host_type.strip():
+        normalized_host_type = host_type.strip().lower()
+        if normalized_host_type not in {
+            EventHostType.UNCLAIMED.value,
+            EventHostType.INDIVIDUAL.value,
+            EventHostType.ORG.value,
+        }:
+            raise HTTPException(status_code=422, detail="Invalid host_type filter")
+        query = query.filter(NetworkEvent.host_type == normalized_host_type)
+
+    events = query.offset(safe_offset).limit(safe_limit).all()
+    user_id = _actor_user_id(current_user)
+    if mine and user_id:
+        filtered: list[NetworkEvent] = []
+        for event in events:
+            if event.claimed_by_user_id == user_id:
+                filtered.append(event)
+                continue
+            if event.host_type == EventHostType.INDIVIDUAL.value and event.host_user_id == user_id:
+                filtered.append(event)
+                continue
+            if event.host_type == EventHostType.ORG.value and event.host_org_id:
+                host_org = session.query(Organization).filter(Organization.id == event.host_org_id).first()
+                if host_org and _is_org_admin(host_org, current_user):
+                    filtered.append(event)
+        events = filtered
+
+    return [_map_network_event(event, current_user, session) for event in events]
+
+
+@app.post("/api/network/events", response_model=NetworkEventResponse)
+async def create_network_event(
+    payload: NetworkEventCreate,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    _throttle_action(f"network:create-event:{user_id}", limit=25, window_seconds=3600)
+
+    if payload.ends_at and payload.starts_at and payload.ends_at < payload.starts_at:
+        raise HTTPException(status_code=422, detail="ends_at must be greater than or equal to starts_at")
+
+    source_url = _validate_public_url(payload.source_url, "source_url")
+    if source_url:
+        existing = session.query(NetworkEvent).filter(NetworkEvent.source_url == source_url).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Event for this source URL already exists")
+
+    resolved_host_type, resolved_host_user_id, resolved_host_org_id = _resolve_event_host_binding(
+        host_type=payload.host_type,
+        host_user_id=payload.host_user_id,
+        host_org_id=payload.host_org_id,
+        current_user=current_user,
+        session=session,
+    )
+    slug = _ensure_unique_event_slug(session, payload.title)
+    event = NetworkEvent(
+        id=uuid.uuid4(),
+        title=payload.title.strip(),
+        slug=slug,
+        description=payload.description,
+        starts_at=payload.starts_at,
+        ends_at=payload.ends_at,
+        location=payload.location.strip() if payload.location else None,
+        source_url=source_url,
+        image_url=_validate_public_url(payload.image_url, "image_url"),
+        tags=payload.tags or [],
+        host_type=resolved_host_type,
+        host_user_id=resolved_host_user_id,
+        host_org_id=resolved_host_org_id,
+        claimed_by_user_id=user_id if payload.claim_on_create else None,
+        created_by_user_id=user_id,
+        seeded_from_events=False,
+    )
+    session.add(event)
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="event.created",
+        target_type="network_event",
+        target_id=str(event.id),
+        metadata={
+            "slug": event.slug,
+            "title": event.title,
+            "host_type": event.host_type,
+            "claim_on_create": payload.claim_on_create,
+        },
+    )
+    session.commit()
+    session.refresh(event)
+    return _map_network_event(event, current_user, session)
+
+
+@app.post("/api/network/events/{event_id}/claim", response_model=NetworkEventResponse)
+async def claim_network_event(
+    event_id: uuid.UUID,
+    payload: NetworkEventClaimRequest,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user)
+    _throttle_action(f"network:claim-event:{user_id}", limit=40, window_seconds=3600)
+    event = session.query(NetworkEvent).filter(NetworkEvent.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    if event.claimed_by_user_id and event.claimed_by_user_id != user_id:
+        raise HTTPException(status_code=409, detail="Event is already claimed")
+
+    resolved_host_type, resolved_host_user_id, resolved_host_org_id = _resolve_event_host_binding(
+        host_type=payload.host_type,
+        host_user_id=payload.host_user_id,
+        host_org_id=payload.host_org_id,
+        current_user=current_user,
+        session=session,
+    )
+
+    event.host_type = resolved_host_type
+    event.host_user_id = resolved_host_user_id
+    event.host_org_id = resolved_host_org_id
+    event.claimed_by_user_id = user_id
+    if not event.created_by_user_id:
+        event.created_by_user_id = user_id
+    event.updated_at = datetime.now(timezone.utc)
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="event.claimed",
+        target_type="network_event",
+        target_id=str(event.id),
+        metadata={
+            "claimed_by": user_id,
+            "host_type": event.host_type,
+            "host_user_id": event.host_user_id,
+            "host_org_id": str(event.host_org_id) if event.host_org_id else None,
+        },
+    )
+    session.commit()
+    session.refresh(event)
+    return _map_network_event(event, current_user, session)
+
+
+@app.post("/api/network/events/{event_id}/unclaim", response_model=NetworkEventResponse)
+async def unclaim_network_event(
+    event_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user)
+    event = session.query(NetworkEvent).filter(NetworkEvent.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    if event.claimed_by_user_id is None:
+        return _map_network_event(event, current_user, session)
+    if not current_user.get("is_admin") and event.claimed_by_user_id != user_id:
+        raise HTTPException(status_code=403, detail="Only the claiming user or an admin can unclaim this event")
+
+    previous_owner = event.claimed_by_user_id
+    event.claimed_by_user_id = None
+    event.updated_at = datetime.now(timezone.utc)
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="event.unclaimed",
+        target_type="network_event",
+        target_id=str(event.id),
+        metadata={"previous_owner": previous_owner},
+    )
+    session.commit()
+    session.refresh(event)
+    return _map_network_event(event, current_user, session)
 
 
 @app.get("/api/network/orgs/{organization_id}/members", response_model=List[OrganizationMembershipResponse])
