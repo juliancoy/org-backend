@@ -1463,7 +1463,13 @@ def _ensure_unique_org_slug(session: Session, preferred: str) -> str:
     base = _slugify(preferred)
     candidate = base
     counter = 2
-    while session.query(Organization).filter(Organization.slug == candidate).first():
+    while (
+        session.query(Organization).filter(Organization.slug == candidate).first()
+        or any(
+            isinstance(obj, Organization) and getattr(obj, "slug", None) == candidate
+            for obj in session.new
+        )
+    ):
         candidate = f"{base}-{counter}"
         counter += 1
     return candidate
@@ -1473,7 +1479,13 @@ def _ensure_unique_event_slug(session: Session, preferred: str) -> str:
     base = _slugify(preferred)
     candidate = base
     counter = 2
-    while session.query(NetworkEvent).filter(NetworkEvent.slug == candidate).first():
+    while (
+        session.query(NetworkEvent).filter(NetworkEvent.slug == candidate).first()
+        or any(
+            isinstance(obj, NetworkEvent) and getattr(obj, "slug", None) == candidate
+            for obj in session.new
+        )
+    ):
         candidate = f"{base}-{counter}"
         counter += 1
     return candidate
