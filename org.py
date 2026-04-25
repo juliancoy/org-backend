@@ -1766,6 +1766,26 @@ def _upsert_ingested_event(
             .first()
         )
 
+    # source_url is globally unique. Some feeds reuse one URL across many events.
+    # Keep the first binding and drop conflicting source_url values for new rows.
+    resolved_source_url = source_url
+    if not event and resolved_source_url:
+        existing_source = session.query(NetworkEvent).filter(NetworkEvent.source_url == resolved_source_url).first()
+        if existing_source:
+            same_instance = (
+                existing_source.title == title
+                or (item.starts_at and existing_source.starts_at == item.starts_at)
+            )
+            if same_instance:
+                event = existing_source
+            else:
+                resolved_source_url = None
+        elif any(
+            isinstance(obj, NetworkEvent) and getattr(obj, "source_url", None) == resolved_source_url
+            for obj in session.new
+        ):
+            resolved_source_url = None
+
     created = False
     if not event:
         event = NetworkEvent(
@@ -1776,7 +1796,7 @@ def _upsert_ingested_event(
             starts_at=item.starts_at,
             ends_at=item.ends_at,
             location=(item.location or "").strip() or None,
-            source_url=source_url,
+            source_url=resolved_source_url,
             ingest_key=ingest_key,
             image_url=image_url,
             tags=tags,
@@ -1795,14 +1815,14 @@ def _upsert_ingested_event(
         event.starts_at = item.starts_at
         event.ends_at = item.ends_at
         event.location = (item.location or "").strip() or None
-        if source_url and source_url != event.source_url:
+        if resolved_source_url and resolved_source_url != event.source_url:
             existing_source_owner = (
                 session.query(NetworkEvent)
-                .filter(NetworkEvent.source_url == source_url, NetworkEvent.id != event.id)
+                .filter(NetworkEvent.source_url == resolved_source_url, NetworkEvent.id != event.id)
                 .first()
             )
             if not existing_source_owner:
-                event.source_url = source_url
+                event.source_url = resolved_source_url
         if image_url:
             event.image_url = image_url
         if tags:
