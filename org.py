@@ -2383,6 +2383,49 @@ async def list_network_events(
     return [_map_network_event(event, current_user, session) for event in events]
 
 
+@app.get("/api/network/events/public", response_model=List[NetworkEventResponse])
+async def list_public_network_events(
+    session: Session = Depends(get_db),
+    q: str = "",
+    upcoming_only: bool = True,
+    limit: int = 60,
+    offset: int = 0,
+):
+    safe_limit = max(1, min(limit, 200))
+    safe_offset = max(0, min(offset, 100000))
+    now_utc = datetime.now(timezone.utc)
+
+    query = session.query(NetworkEvent)
+    if q.strip():
+        needle = f"%{q.strip()}%"
+        query = query.filter(
+            (NetworkEvent.title.ilike(needle))
+            | (NetworkEvent.slug.ilike(needle))
+            | (NetworkEvent.location.ilike(needle))
+            | (NetworkEvent.description.ilike(needle))
+        )
+
+    if upcoming_only:
+        query = query.filter(
+            (NetworkEvent.ends_at.isnot(None) & (NetworkEvent.ends_at >= now_utc))
+            | (NetworkEvent.ends_at.is_(None) & NetworkEvent.starts_at.isnot(None) & (NetworkEvent.starts_at >= now_utc))
+        )
+    query = query.order_by(NetworkEvent.starts_at.asc().nullslast(), NetworkEvent.created_at.desc())
+    events = query.offset(safe_offset).limit(safe_limit).all()
+    return [_map_network_event(event, None, session) for event in events]
+
+
+@app.get("/api/network/events/public/{slug}", response_model=NetworkEventResponse)
+async def get_public_network_event_by_slug(
+    slug: str,
+    session: Session = Depends(get_db),
+):
+    event = session.query(NetworkEvent).filter(NetworkEvent.slug == slug.strip().lower()).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return _map_network_event(event, None, session)
+
+
 @app.post("/api/network/events", response_model=NetworkEventResponse)
 async def create_network_event(
     payload: NetworkEventCreate,
