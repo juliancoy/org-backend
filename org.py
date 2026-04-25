@@ -917,6 +917,23 @@ class OrganizationResponse(BaseModel):
         from_attributes = True
 
 
+class PublicOrganizationResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    slug: str
+    description: Optional[str] = None
+    source_url: Optional[str] = None
+    image_url: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    seeded_from_events: bool
+    upcoming_events_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class NetworkEventCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
@@ -1523,6 +1540,34 @@ def _map_org(org: Organization, current_user_id: Optional[str] = None) -> Organi
         created_by_user_id=org.created_by_user_id,
         membership_count=len(org.memberships or []),
         my_role=my_role,
+        created_at=org.created_at,
+        updated_at=org.updated_at,
+    )
+
+
+def _map_public_org(org: Organization, session: Session) -> PublicOrganizationResponse:
+    now_utc = datetime.now(timezone.utc)
+    upcoming_events_count = (
+        session.query(NetworkEvent)
+        .filter(
+            NetworkEvent.host_org_id == org.id,
+            (
+                (NetworkEvent.ends_at.isnot(None) & (NetworkEvent.ends_at >= now_utc))
+                | (NetworkEvent.ends_at.is_(None) & NetworkEvent.starts_at.isnot(None) & (NetworkEvent.starts_at >= now_utc))
+            ),
+        )
+        .count()
+    )
+    return PublicOrganizationResponse(
+        id=org.id,
+        name=org.name,
+        slug=org.slug,
+        description=org.description,
+        source_url=org.source_url,
+        image_url=org.image_url,
+        tags=list(org.tags or []),
+        seeded_from_events=bool(org.seeded_from_events),
+        upcoming_events_count=upcoming_events_count,
         created_at=org.created_at,
         updated_at=org.updated_at,
     )
@@ -2188,6 +2233,49 @@ async def list_organizations(
             or any(m.user_id == user_id for m in org.memberships or [])
         ]
     return [_map_org(org, user_id) for org in organizations]
+
+
+@app.get("/api/network/orgs/public/{slug}", response_model=PublicOrganizationResponse)
+async def get_public_organization(
+    slug: str,
+    session: Session = Depends(get_db),
+):
+    normalized = slug.strip().lower()
+    org = session.query(Organization).filter(Organization.slug == normalized).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    return _map_public_org(org, session)
+
+
+@app.get("/api/network/orgs/public/{slug}/events", response_model=List[NetworkEventResponse])
+async def list_public_organization_events(
+    slug: str,
+    session: Session = Depends(get_db),
+    upcoming_only: bool = True,
+    limit: int = 60,
+    offset: int = 0,
+):
+    normalized = slug.strip().lower()
+    org = session.query(Organization).filter(Organization.slug == normalized).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    safe_limit = max(1, min(limit, 200))
+    safe_offset = max(0, min(offset, 100000))
+    now_utc = datetime.now(timezone.utc)
+    query = (
+        session.query(NetworkEvent)
+        .filter(NetworkEvent.host_org_id == org.id)
+        .order_by(NetworkEvent.starts_at.asc().nullslast(), NetworkEvent.created_at.desc())
+    )
+    if upcoming_only:
+        query = query.filter(
+            (NetworkEvent.ends_at.isnot(None) & (NetworkEvent.ends_at >= now_utc))
+            | (NetworkEvent.ends_at.is_(None) & NetworkEvent.starts_at.isnot(None) & (NetworkEvent.starts_at >= now_utc))
+        )
+
+    events = query.offset(safe_offset).limit(safe_limit).all()
+    return [_map_network_event(event, None, session) for event in events]
 
 
 @app.post("/api/network/orgs", response_model=OrganizationResponse)
