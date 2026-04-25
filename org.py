@@ -80,6 +80,22 @@ ORG_ADMIN_USER_IDS = [
     for item in os.environ.get("ORG_ADMIN_USER_IDS", "").split(",")
     if item.strip()
 ]
+ORG_PUBLIC_CALENDAR_FEEDS = [
+    item.strip()
+    for item in os.environ.get(
+        "ORG_PUBLIC_CALENDAR_FEEDS",
+        "https://codecollective.us/baltimore/upcoming_events.json",
+    ).split(",")
+    if item.strip()
+]
+ORG_PUBLIC_CALENDAR_PULL_INTERVAL_SECONDS = max(
+    60,
+    int(os.environ.get("ORG_PUBLIC_CALENDAR_PULL_INTERVAL_SECONDS", "900")),
+)
+ORG_PUBLIC_CALENDAR_PULL_ENABLED = os.environ.get(
+    "ORG_PUBLIC_CALENDAR_PULL_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
 
 # System Constants
 SYSTEM_CURRENCY = "DEM"
@@ -157,6 +173,38 @@ class EventHostType(str, Enum):
     UNCLAIMED = "unclaimed"
     INDIVIDUAL = "individual"
     ORG = "org"
+
+
+class GovernanceMotionType(str, Enum):
+    MAIN = "main"
+    AMENDMENT = "amendment"
+
+
+class GovernanceMotionStatus(str, Enum):
+    PROPOSED = "proposed"
+    SECONDED = "seconded"
+    DISCUSSION = "discussion"
+    VOTING = "voting"
+    PASSED = "passed"
+    FAILED = "failed"
+    TABLED = "tabled"
+    WITHDRAWN = "withdrawn"
+
+
+class GovernanceProposerType(str, Enum):
+    USER = "user"
+    ORG = "org"
+
+
+class GovernanceVoteChoice(str, Enum):
+    YEA = "yea"
+    NAY = "nay"
+    ABSTAIN = "abstain"
+
+
+class GovernanceReactionType(str, Enum):
+    UP = "up"
+    DOWN = "down"
 
 class Account(Base):
     """Financial account for individuals, businesses, nonprofits, or government"""
@@ -539,6 +587,7 @@ class Organization(Base):
     slug = Column(String(255), nullable=False, unique=True, index=True)
     description = Column(Text)
     source_url = Column(Text, unique=True, index=True)
+    source_urls = Column(JSONB)
     image_url = Column(Text)
     tags = Column(JSONB)
     seeded_from_events = Column(Boolean, nullable=False, default=False)
@@ -548,7 +597,9 @@ class Organization(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
 
     memberships = relationship("OrganizationMembership", back_populates="organization", cascade="all, delete-orphan")
-    hosted_events = relationship("NetworkEvent", back_populates="host_org")
+    # Let DB-level FK ondelete behavior handle parent deletes; avoid ORM nulling
+    # host_org_id during merges, which can violate host_type/org binding checks.
+    hosted_events = relationship("NetworkEvent", back_populates="host_org", passive_deletes=True)
 
 
 class NetworkEvent(Base):
@@ -672,6 +723,95 @@ class NetworkAuditEvent(Base):
     target_id = Column(String(255), nullable=False, index=True)
     metadata_json = Column("metadata", JSONB)
     created_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), index=True)
+
+
+class GovernanceMotion(Base):
+    __tablename__ = "governance_motions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    type = Column(String(32), nullable=False, default=GovernanceMotionType.MAIN.value, index=True)
+    parent_motion_id = Column(UUID(as_uuid=True), ForeignKey("governance_motions.id", ondelete="SET NULL"), index=True)
+    title = Column(String(255), nullable=False)
+    body = Column(Text, nullable=False)
+    proposed_body_diff = Column(Text)
+    status = Column(String(32), nullable=False, default=GovernanceMotionStatus.PROPOSED.value, index=True)
+    proposer_type = Column(String(16), nullable=False, default=GovernanceProposerType.USER.value, index=True)
+    proposer_user_id = Column(String(255), nullable=False, index=True)
+    proposer_name = Column(String(255), nullable=False)
+    proposer_user_name = Column(String(255))
+    proposer_org_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL"), index=True)
+    proposer_org_name = Column(String(255))
+    seconder_id = Column(String(255), index=True)
+    seconder_name = Column(String(255))
+    discussion_deadline = Column(DateTime(timezone=True))
+    voting_deadline = Column(DateTime(timezone=True))
+    quorum_required = Column(Integer, nullable=False, default=5)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now(), index=True)
+
+    __table_args__ = (
+        Index("idx_governance_motions_status_created", "status", "created_at"),
+        CheckConstraint("quorum_required >= 1", name="check_governance_motion_quorum_positive"),
+        CheckConstraint("type IN ('main','amendment')", name="check_governance_motion_type"),
+        CheckConstraint(
+            "status IN ('proposed','seconded','discussion','voting','passed','failed','tabled','withdrawn')",
+            name="check_governance_motion_status",
+        ),
+        CheckConstraint("proposer_type IN ('user','org')", name="check_governance_motion_proposer_type"),
+    )
+
+    votes = relationship("GovernanceVote", back_populates="motion", cascade="all, delete-orphan")
+    comments = relationship("GovernanceComment", back_populates="motion", cascade="all, delete-orphan")
+    reactions = relationship("GovernanceReaction", back_populates="motion", cascade="all, delete-orphan")
+
+
+class GovernanceVote(Base):
+    __tablename__ = "governance_votes"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    motion_id = Column(UUID(as_uuid=True), ForeignKey("governance_motions.id", ondelete="CASCADE"), nullable=False, index=True)
+    voter_user_id = Column(String(255), nullable=False, index=True)
+    voter_name = Column(String(255), nullable=False)
+    choice = Column(String(16), nullable=False, index=True)
+    cast_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), index=True)
+
+    __table_args__ = (
+        Index("idx_governance_votes_motion_user_unique", "motion_id", "voter_user_id", unique=True),
+        CheckConstraint("choice IN ('yea','nay','abstain')", name="check_governance_vote_choice"),
+    )
+
+    motion = relationship("GovernanceMotion", back_populates="votes")
+
+
+class GovernanceComment(Base):
+    __tablename__ = "governance_comments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    motion_id = Column(UUID(as_uuid=True), ForeignKey("governance_motions.id", ondelete="CASCADE"), nullable=False, index=True)
+    author_id = Column(String(255), nullable=False, index=True)
+    author_name = Column(String(255), nullable=False)
+    body = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), index=True)
+
+    motion = relationship("GovernanceMotion", back_populates="comments")
+
+
+class GovernanceReaction(Base):
+    __tablename__ = "governance_reactions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    motion_id = Column(UUID(as_uuid=True), ForeignKey("governance_motions.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String(255), nullable=False, index=True)
+    direction = Column(String(8), nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_governance_reactions_motion_user_unique", "motion_id", "user_id", unique=True),
+        CheckConstraint("direction IN ('up','down')", name="check_governance_reaction_direction"),
+    )
+
+    motion = relationship("GovernanceMotion", back_populates="reactions")
 
 # ============= PYDANTIC MODELS =============
 
@@ -855,6 +995,13 @@ class OrganizationCreate(BaseModel):
     claim_on_create: bool = True
 
 
+class OrganizationUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+
 class OrganizationMembershipUpsert(BaseModel):
     user_id: str = Field(..., min_length=1, max_length=255)
     user_email: Optional[str] = None
@@ -868,6 +1015,10 @@ class OrganizationMembershipUpdate(BaseModel):
 
 class OrganizationClaimRequestCreate(BaseModel):
     message: Optional[str] = Field(None, max_length=4000)
+
+
+class OrganizationMergeRequest(BaseModel):
+    source_organization_id: uuid.UUID
 
 
 class OrganizationClaimRequestResponse(BaseModel):
@@ -884,6 +1035,22 @@ class OrganizationClaimRequestResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class OrganizationClaimRequestQueueItemResponse(BaseModel):
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    organization_name: str
+    organization_slug: str
+    organization_claimed_by_user_id: Optional[str] = None
+    requested_by_user_id: str
+    requested_by_email: Optional[str] = None
+    requested_by_name: Optional[str] = None
+    message: Optional[str] = None
+    status: str
+    reviewed_by_user_id: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    created_at: datetime
 
 
 class OrganizationMembershipResponse(BaseModel):
@@ -903,6 +1070,7 @@ class OrganizationResponse(BaseModel):
     slug: str
     description: Optional[str] = None
     source_url: Optional[str] = None
+    source_urls: List[str] = Field(default_factory=list)
     image_url: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
     seeded_from_events: bool
@@ -923,15 +1091,47 @@ class PublicOrganizationResponse(BaseModel):
     slug: str
     description: Optional[str] = None
     source_url: Optional[str] = None
+    source_urls: List[str] = Field(default_factory=list)
     image_url: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
     seeded_from_events: bool
     upcoming_events_count: int = 0
+    pending_claim_requests_count: int = 0
+    is_contested: bool = False
+    redirected_from_slug: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class PublicOrganizationListItemResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    slug: str
+    description: Optional[str] = None
+    source_url: Optional[str] = None
+    source_urls: List[str] = Field(default_factory=list)
+    image_url: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    seeded_from_events: bool
+    membership_count: int = 0
+    upcoming_events_count: int = 0
+    pending_claim_requests_count: int = 0
+    is_contested: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PublicOrganizationAdminResponse(BaseModel):
+    user_id: str
+    user_name: Optional[str] = None
+    user_email: Optional[str] = None
+    role: str = "admin"
 
 
 class NetworkEventCreate(BaseModel):
@@ -982,6 +1182,81 @@ class NetworkEventResponse(BaseModel):
         from_attributes = True
 
 
+class GovernanceMotionCreate(BaseModel):
+    type: str = Field(GovernanceMotionType.MAIN.value, pattern="^(main|amendment)$")
+    parent_motion_id: Optional[uuid.UUID] = None
+    title: str = Field(..., min_length=1, max_length=255)
+    body: str = Field(..., min_length=1)
+    proposed_body_diff: Optional[str] = None
+    proposer_type: str = Field(GovernanceProposerType.USER.value, pattern="^(user|org)$")
+    proposer_org_id: Optional[uuid.UUID] = None
+    quorum_required: int = Field(5, ge=1, le=100000)
+
+
+class GovernanceMotionResponse(BaseModel):
+    id: uuid.UUID
+    type: str
+    parent_motion_id: Optional[uuid.UUID] = None
+    title: str
+    body: str
+    proposed_body_diff: Optional[str] = None
+    status: str
+    proposer_type: str
+    proposer_id: str
+    proposer_name: str
+    proposer_user_name: Optional[str] = None
+    proposer_org_id: Optional[uuid.UUID] = None
+    proposer_org_name: Optional[str] = None
+    seconder_id: Optional[str] = None
+    seconder_name: Optional[str] = None
+    discussion_deadline: Optional[datetime] = None
+    voting_deadline: Optional[datetime] = None
+    quorum_required: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class GovernanceMotionVoteCastRequest(BaseModel):
+    choice: str = Field(..., pattern="^(yea|nay|abstain)$")
+
+
+class GovernanceCommentCreate(BaseModel):
+    body: str = Field(..., min_length=1, max_length=10000)
+
+
+class GovernanceCommentResponse(BaseModel):
+    id: uuid.UUID
+    motion_id: uuid.UUID
+    author_id: str
+    author_name: str
+    body: str
+    created_at: datetime
+
+
+class GovernanceReactionResponse(BaseModel):
+    score: int
+    user_vote: Optional[str] = None
+
+
+class GovernanceVoteCountsResponse(BaseModel):
+    up: int = 0
+    down: int = 0
+    score: int = 0
+
+
+class GovernanceUserVoteResponse(BaseModel):
+    user_vote: Optional[str] = None
+
+
+class GovernanceVoteResultResponse(BaseModel):
+    yea: int = 0
+    nay: int = 0
+    abstain: int = 0
+    total_eligible: int = 0
+    quorum_met: bool = False
+    passed: bool = False
+
+
 class CalendarIngestOrganization(BaseModel):
     name: Optional[str] = Field(None, max_length=255)
     source_url: Optional[str] = None
@@ -999,6 +1274,8 @@ class CalendarIngestEvent(BaseModel):
     location: Optional[str] = Field(None, max_length=255)
     source_url: Optional[str] = None
     host_org_source_url: Optional[str] = None
+    host_org_name: Optional[str] = Field(None, max_length=255)
+    host_org_image_url: Optional[str] = None
     image_url: Optional[str] = None
     tags: Optional[List[str]] = None
     city: Optional[str] = Field(None, max_length=64)
@@ -1059,6 +1336,33 @@ class ContactPageResponse(BaseModel):
     website_url: Optional[str] = None
     links: List[ContactLink] = Field(default_factory=list)
     public_url: Optional[str] = None
+    updated_at: datetime
+
+
+class PublicUserProfileResponse(BaseModel):
+    user_id: str
+    user_name: str
+    slug: str
+    headline: Optional[str] = None
+    bio: Optional[str] = None
+    photo_url: Optional[str] = None
+    email_public: Optional[str] = None
+    phone_public: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    website_url: Optional[str] = None
+    links: List[ContactLink] = Field(default_factory=list)
+    public_url: Optional[str] = None
+    upcoming_events_count: int = 0
+    updated_at: datetime
+
+
+class PublicUserListItemResponse(BaseModel):
+    user_id: str
+    user_name: str
+    slug: str
+    headline: Optional[str] = None
+    photo_url: Optional[str] = None
+    upcoming_events_count: int = 0
     updated_at: datetime
 
 # ============= DATABASE DEPENDENCY =============
@@ -1324,6 +1628,9 @@ def _ensure_network_ingest_schema() -> None:
     statements = [
         "ALTER TABLE IF EXISTS network_events ADD COLUMN IF NOT EXISTS ingest_key VARCHAR(255)",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_network_events_ingest_key ON network_events (ingest_key)",
+        "ALTER TABLE IF EXISTS organizations ADD COLUMN IF NOT EXISTS source_urls JSONB",
+        "CREATE INDEX IF NOT EXISTS idx_organizations_source_urls_gin ON organizations USING GIN (source_urls)",
+        "UPDATE organizations SET source_urls = jsonb_build_array(source_url) WHERE source_url IS NOT NULL AND (source_urls IS NULL OR jsonb_typeof(source_urls) <> 'array' OR jsonb_array_length(source_urls) = 0)",
     ]
     with db.engine.begin() as conn:
         for statement in statements:
@@ -1383,9 +1690,20 @@ async def lifespan(app: FastAPI):
         await _spicedb_write_relationships(relationships)
     except Exception as exc:
         logger.warning(f"SpiceDB bootstrap skipped: {exc}")
-    
+
+    public_calendar_task: Optional[asyncio.Task] = None
+    if ORG_PUBLIC_CALENDAR_PULL_ENABLED and ORG_PUBLIC_CALENDAR_FEEDS:
+        public_calendar_task = asyncio.create_task(_public_calendar_pull_loop())
+
     yield
-    
+
+    if public_calendar_task:
+        public_calendar_task.cancel()
+        try:
+            await public_calendar_task
+        except asyncio.CancelledError:
+            pass
+
     await db.disconnect()
 
 app = FastAPI(lifespan=lifespan)
@@ -1533,6 +1851,7 @@ def _map_org(org: Organization, current_user_id: Optional[str] = None) -> Organi
         slug=org.slug,
         description=org.description,
         source_url=org.source_url,
+        source_urls=_org_source_urls(org),
         image_url=org.image_url,
         tags=list(org.tags or []),
         seeded_from_events=bool(org.seeded_from_events),
@@ -1545,7 +1864,11 @@ def _map_org(org: Organization, current_user_id: Optional[str] = None) -> Organi
     )
 
 
-def _map_public_org(org: Organization, session: Session) -> PublicOrganizationResponse:
+def _map_public_org(
+    org: Organization,
+    session: Session,
+    redirected_from_slug: Optional[str] = None,
+) -> PublicOrganizationResponse:
     now_utc = datetime.now(timezone.utc)
     upcoming_events_count = (
         session.query(NetworkEvent)
@@ -1558,19 +1881,148 @@ def _map_public_org(org: Organization, session: Session) -> PublicOrganizationRe
         )
         .count()
     )
+    pending_claim_requests_count = (
+        session.query(OrganizationClaimRequest)
+        .filter(
+            OrganizationClaimRequest.organization_id == org.id,
+            OrganizationClaimRequest.status == "pending",
+        )
+        .count()
+    )
     return PublicOrganizationResponse(
         id=org.id,
         name=org.name,
         slug=org.slug,
         description=org.description,
         source_url=org.source_url,
+        source_urls=_org_source_urls(org),
         image_url=org.image_url,
         tags=list(org.tags or []),
         seeded_from_events=bool(org.seeded_from_events),
         upcoming_events_count=upcoming_events_count,
+        pending_claim_requests_count=pending_claim_requests_count,
+        is_contested=bool(pending_claim_requests_count > 0),
+        redirected_from_slug=redirected_from_slug,
         created_at=org.created_at,
         updated_at=org.updated_at,
     )
+
+
+def _map_public_org_list_item(
+    org: Organization,
+    membership_count: int,
+    upcoming_events_count: int,
+    pending_claim_requests_count: int,
+) -> PublicOrganizationListItemResponse:
+    return PublicOrganizationListItemResponse(
+        id=org.id,
+        name=org.name,
+        slug=org.slug,
+        description=org.description,
+        source_url=org.source_url,
+        source_urls=_org_source_urls(org),
+        image_url=org.image_url,
+        tags=list(org.tags or []),
+        seeded_from_events=bool(org.seeded_from_events),
+        membership_count=int(membership_count or 0),
+        upcoming_events_count=int(upcoming_events_count or 0),
+        pending_claim_requests_count=int(pending_claim_requests_count or 0),
+        is_contested=bool((pending_claim_requests_count or 0) > 0),
+        created_at=org.created_at,
+        updated_at=org.updated_at,
+    )
+
+
+def _map_governance_motion(motion: GovernanceMotion) -> GovernanceMotionResponse:
+    return GovernanceMotionResponse(
+        id=motion.id,
+        type=motion.type,
+        parent_motion_id=motion.parent_motion_id,
+        title=motion.title,
+        body=motion.body,
+        proposed_body_diff=motion.proposed_body_diff,
+        status=motion.status,
+        proposer_type=motion.proposer_type,
+        proposer_id=motion.proposer_user_id,
+        proposer_name=motion.proposer_name,
+        proposer_user_name=motion.proposer_user_name,
+        proposer_org_id=motion.proposer_org_id,
+        proposer_org_name=motion.proposer_org_name,
+        seconder_id=motion.seconder_id,
+        seconder_name=motion.seconder_name,
+        discussion_deadline=motion.discussion_deadline,
+        voting_deadline=motion.voting_deadline,
+        quorum_required=motion.quorum_required,
+        created_at=motion.created_at,
+        updated_at=motion.updated_at,
+    )
+
+
+def _governance_vote_result(motion: GovernanceMotion) -> Dict[str, Any]:
+    yea = sum(1 for v in motion.votes if v.choice == GovernanceVoteChoice.YEA.value)
+    nay = sum(1 for v in motion.votes if v.choice == GovernanceVoteChoice.NAY.value)
+    abstain = sum(1 for v in motion.votes if v.choice == GovernanceVoteChoice.ABSTAIN.value)
+    quorum_met = len(motion.votes) >= int(motion.quorum_required or 0)
+    passed = quorum_met and yea > nay
+    return {
+        "yea": yea,
+        "nay": nay,
+        "abstain": abstain,
+        "total_eligible": int(motion.quorum_required or 0),
+        "quorum_met": quorum_met,
+        "passed": passed,
+    }
+
+
+def _governance_reaction_counts(motion: GovernanceMotion) -> GovernanceVoteCountsResponse:
+    up = sum(1 for r in motion.reactions if r.direction == GovernanceReactionType.UP.value)
+    down = sum(1 for r in motion.reactions if r.direction == GovernanceReactionType.DOWN.value)
+    return GovernanceVoteCountsResponse(up=up, down=down, score=up - down)
+
+
+def _can_manage_governance_motion(
+    motion: GovernanceMotion,
+    current_user: dict,
+    session: Session,
+) -> bool:
+    if current_user.get("is_admin"):
+        return True
+    user_id = _actor_user_id(current_user)
+    if not user_id:
+        return False
+    if motion.proposer_user_id == user_id:
+        return True
+    if motion.proposer_type == GovernanceProposerType.ORG.value and motion.proposer_org_id:
+        org = session.query(Organization).filter(Organization.id == motion.proposer_org_id).first()
+        if org and _is_org_admin(org, current_user):
+            return True
+    return False
+
+
+def _ensure_governance_transition(motion: GovernanceMotion, target_status: str) -> None:
+    transitions = {
+        GovernanceMotionStatus.PROPOSED.value: {
+            GovernanceMotionStatus.SECONDED.value,
+            GovernanceMotionStatus.WITHDRAWN.value,
+            GovernanceMotionStatus.DISCUSSION.value,
+        },
+        GovernanceMotionStatus.SECONDED.value: {GovernanceMotionStatus.DISCUSSION.value},
+        GovernanceMotionStatus.DISCUSSION.value: {
+            GovernanceMotionStatus.VOTING.value,
+            GovernanceMotionStatus.TABLED.value,
+        },
+        GovernanceMotionStatus.VOTING.value: {
+            GovernanceMotionStatus.PASSED.value,
+            GovernanceMotionStatus.FAILED.value,
+        },
+        GovernanceMotionStatus.TABLED.value: {GovernanceMotionStatus.DISCUSSION.value},
+    }
+    allowed = transitions.get(motion.status, set())
+    if target_status not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status transition from {motion.status} to {target_status}",
+        )
 
 
 def _map_network_event(event: NetworkEvent, current_user: Optional[dict], session: Session) -> NetworkEventResponse:
@@ -1692,6 +2144,54 @@ def _normalize_ingest_url(value: Optional[str]) -> Optional[str]:
     return cleaned
 
 
+def _normalize_org_source_urls(values: Optional[List[str]]) -> List[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        url = _normalize_ingest_url(raw)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        normalized.append(url)
+    return normalized
+
+
+def _org_source_urls(org: Organization) -> List[str]:
+    urls = _normalize_org_source_urls(list(org.source_urls or []))
+    canonical = _normalize_ingest_url(org.source_url)
+    if canonical and canonical not in urls:
+        urls.insert(0, canonical)
+    return urls
+
+
+def _set_org_source_urls(org: Organization, values: List[str]) -> None:
+    normalized = _normalize_org_source_urls(values)
+    org.source_urls = normalized
+    if not org.source_url and normalized:
+        org.source_url = normalized[0]
+
+
+def _add_org_source_url(org: Organization, value: Optional[str]) -> None:
+    url = _normalize_ingest_url(value)
+    if not url:
+        return
+    merged = _org_source_urls(org)
+    if url in merged:
+        return
+    merged.append(url)
+    _set_org_source_urls(org, merged)
+
+
+def _find_org_by_source_url(session: Session, value: Optional[str]) -> Optional[Organization]:
+    url = _normalize_ingest_url(value)
+    if not url:
+        return None
+    org = session.query(Organization).filter(Organization.source_url == url).first()
+    if org:
+        return org
+    return session.query(Organization).filter(Organization.source_urls.contains([url])).first()
+
+
 def _clean_ingest_tags(tags: Optional[List[str]], city: Optional[str] = None) -> List[str]:
     cleaned: list[str] = []
     for tag in tags or []:
@@ -1732,6 +2232,110 @@ def _build_ingest_event_key(item: CalendarIngestEvent) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def _coerce_calendar_datetime(value: Optional[Any]) -> Optional[datetime]:
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+    if text_value.endswith("Z"):
+        text_value = text_value[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text_value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _render_public_event_location(value: Optional[Any]) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        location = value.strip()
+        return location or None
+    if not isinstance(value, dict):
+        return None
+    parts: list[str] = []
+    for key in ("name", "address", "city", "state", "postalCode", "country"):
+        field_value = str(value.get(key) or "").strip()
+        if field_value:
+            parts.append(field_value)
+    if not parts and value.get("latitude") is not None and value.get("longitude") is not None:
+        parts.append(f"{value.get('latitude')}, {value.get('longitude')}")
+    return ", ".join(parts) if parts else None
+
+
+def _derive_public_event_org_name(raw_event: Dict[str, Any], host_org_source_url: Optional[str]) -> str:
+    for key in ("org_name", "orgName", "source_group", "group_name"):
+        candidate = str(raw_event.get(key) or "").strip()
+        if candidate:
+            return candidate
+    organizer = raw_event.get("organizer")
+    if isinstance(organizer, dict):
+        name = str(organizer.get("name") or "").strip()
+        if name:
+            return name
+    if isinstance(organizer, str):
+        name = organizer.strip()
+        if name:
+            return name
+    if host_org_source_url:
+        return _derive_org_name(host_org_source_url, None)
+    return "Organization"
+
+
+def _city_from_feed_url(feed_url: str) -> Optional[str]:
+    cleaned = feed_url.split("://", 1)[-1]
+    path = "/" + cleaned.split("/", 1)[1] if "/" in cleaned else ""
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) >= 2 and segments[-1].lower() == "upcoming_events.json":
+        return segments[-2].strip().lower() or None
+    return None
+
+
+def _build_ingest_payload_from_public_feed(
+    feed_url: str,
+    raw_events: List[Dict[str, Any]],
+) -> CalendarIngestPayload:
+    city = _city_from_feed_url(feed_url)
+    events: list[CalendarIngestEvent] = []
+    for raw_event in raw_events:
+        if not isinstance(raw_event, dict):
+            continue
+        title = str(raw_event.get("name") or raw_event.get("title") or "").strip()
+        if not title:
+            continue
+        source_url = _normalize_ingest_url(raw_event.get("url") or raw_event.get("source_url"))
+        host_org_source_url = _normalize_ingest_url(raw_event.get("source") or raw_event.get("source_url"))
+        host_org_image_url = _normalize_ingest_url(raw_event.get("orgImageUrl") or raw_event.get("org_image_url"))
+        event_image_url = _normalize_ingest_url(raw_event.get("imageUrl") or raw_event.get("image_url")) or host_org_image_url
+        host_org_name = _derive_public_event_org_name(raw_event, host_org_source_url)
+        events.append(
+            CalendarIngestEvent(
+                title=title,
+                description=str(raw_event.get("description") or "").strip() or None,
+                starts_at=_coerce_calendar_datetime(raw_event.get("startDate") or raw_event.get("starts_at")),
+                ends_at=_coerce_calendar_datetime(raw_event.get("endDate") or raw_event.get("ends_at")),
+                location=_render_public_event_location(raw_event.get("location")),
+                source_url=source_url,
+                host_org_source_url=host_org_source_url,
+                host_org_name=host_org_name,
+                host_org_image_url=host_org_image_url,
+                image_url=event_image_url,
+                tags=raw_event.get("tags") if isinstance(raw_event.get("tags"), list) else None,
+                city=str(raw_event.get("city") or city or "").strip() or None,
+            )
+        )
+    return CalendarIngestPayload(
+        source="codecollective-public-json",
+        generated_at=datetime.now(timezone.utc),
+        organizations=[],
+        events=events,
+    )
+
+
 def _upsert_ingested_organization(
     session: Session,
     item: CalendarIngestOrganization,
@@ -1742,9 +2346,7 @@ def _upsert_ingested_organization(
     image_url = _normalize_ingest_url(item.image_url)
     description = (item.description or "").strip() or None
 
-    org = None
-    if source_url:
-        org = session.query(Organization).filter(Organization.source_url == source_url).first()
+    org = _find_org_by_source_url(session, source_url)
     if not org:
         candidate_slug = _slugify(name)
         org = session.query(Organization).filter(Organization.slug == candidate_slug).first()
@@ -1757,6 +2359,7 @@ def _upsert_ingested_organization(
             slug=_ensure_unique_org_slug(session, name),
             description=description,
             source_url=source_url,
+            source_urls=[source_url] if source_url else [],
             image_url=image_url,
             tags=tags,
             seeded_from_events=True,
@@ -1768,8 +2371,7 @@ def _upsert_ingested_organization(
             org.name = name
             if description:
                 org.description = description
-        if source_url and not org.source_url:
-            org.source_url = source_url
+        _add_org_source_url(org, source_url)
         if image_url:
             org.image_url = image_url
         if tags:
@@ -1973,9 +2575,7 @@ def _seed_organizations_from_event_sources(session: Session, force_update: bool 
         tags = src.get("tags") if isinstance(src.get("tags"), list) else []
         image_url = str(src.get("orgImageUrl") or "").strip() or None
 
-        org = None
-        if source_url:
-            org = session.query(Organization).filter(Organization.source_url == source_url).first()
+        org = _find_org_by_source_url(session, source_url)
         if not org:
             slug = _ensure_unique_org_slug(session, name)
             org = Organization(
@@ -1984,6 +2584,7 @@ def _seed_organizations_from_event_sources(session: Session, force_update: bool 
                 slug=slug,
                 description=f"Seeded from Code Collective events source: {name}",
                 source_url=source_url,
+                source_urls=[source_url] if source_url else [],
                 image_url=image_url,
                 tags=tags,
                 seeded_from_events=True,
@@ -1994,6 +2595,7 @@ def _seed_organizations_from_event_sources(session: Session, force_update: bool 
 
         if force_update:
             org.name = name
+            _add_org_source_url(org, source_url)
             if image_url:
                 org.image_url = image_url
             if tags:
@@ -2019,6 +2621,60 @@ def _is_org_admin(org: Organization, current_user: dict) -> bool:
             return True
     return False
 
+
+def _can_manage_org_for_merge(org: Organization, current_user: dict) -> bool:
+    if current_user.get("is_admin"):
+        return True
+    # For unclaimed organizations, any authenticated user can fold duplicates into
+    # an org they already manage.
+    if not org.claimed_by_user_id:
+        return True
+    return _is_org_admin(org, current_user)
+
+
+def _claim_org_record(session: Session, org: Organization, current_user: dict) -> None:
+    user_id = _actor_user_id(current_user)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if org.claimed_by_user_id and org.claimed_by_user_id != user_id:
+        raise HTTPException(status_code=409, detail="Organization is already claimed")
+
+    org.claimed_by_user_id = user_id
+    if not org.created_by_user_id:
+        org.created_by_user_id = user_id
+
+    membership = (
+        session.query(OrganizationMembership)
+        .filter(
+            OrganizationMembership.organization_id == org.id,
+            OrganizationMembership.user_id == user_id,
+        )
+        .first()
+    )
+    if not membership:
+        membership = OrganizationMembership(
+            id=uuid.uuid4(),
+            organization=org,
+            user_id=user_id,
+            user_email=current_user.get("email"),
+            user_name=current_user.get("name"),
+            role="admin",
+        )
+        session.add(membership)
+    else:
+        membership.role = "admin"
+        membership.user_email = current_user.get("email")
+        membership.user_name = current_user.get("name")
+
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="org.claimed",
+        target_type="organization",
+        target_id=str(org.id),
+        metadata={"claimed_by": user_id},
+    )
+
 # ============= ECONOMIC ENGINE =============
 
 class EconomicEngine:
@@ -2027,7 +2683,7 @@ class EconomicEngine:
         """Calculate tax with progressive rates"""
         if entity_type == EntityType.NONPROFIT:
             return Decimal('0.00')
-        
+
         tax_brackets = [
             (Decimal('0.00'), Decimal('25000.00'), Decimal('0.10')),
             (Decimal('25000.01'), Decimal('50000.00'), Decimal('0.15')),
@@ -2130,15 +2786,10 @@ class EconomicEngine:
 
 # ============= ORG NETWORK ENDPOINTS =============
 
-@app.post("/api/network/ingest/calendar", response_model=CalendarIngestResponse)
-async def ingest_calendar_feed(
+def _ingest_calendar_payload(
+    session: Session,
     payload: CalendarIngestPayload,
-    request: Request,
-    session: Session = Depends(get_db),
-):
-    _require_ingest_auth(request)
-    _throttle_action("network:ingest:calendar", limit=120, window_seconds=3600)
-
+) -> CalendarIngestResponse:
     org_inserted = 0
     org_updated = 0
     event_inserted = 0
@@ -2148,8 +2799,7 @@ async def ingest_calendar_feed(
     host_org_by_source: Dict[str, Organization] = {}
     for item in payload.organizations:
         org, created = _upsert_ingested_organization(session, item)
-        source_url = _normalize_ingest_url(item.source_url)
-        if source_url:
+        for source_url in _org_source_urls(org):
             host_org_by_source[source_url] = org
         if created:
             org_inserted += 1
@@ -2163,12 +2813,14 @@ async def ingest_calendar_feed(
                 session,
                 CalendarIngestOrganization(
                     source_url=source_url,
-                    name=None,
+                    name=(item.host_org_name or "").strip() or None,
+                    image_url=item.host_org_image_url,
                     city=item.city,
                     tags=item.tags or [],
                 ),
             )
-            host_org_by_source[source_url] = fallback_org
+            for mapped_url in _org_source_urls(fallback_org):
+                host_org_by_source[mapped_url] = fallback_org
             if created:
                 org_inserted += 1
             else:
@@ -2191,6 +2843,79 @@ async def ingest_calendar_feed(
         events_updated=event_updated,
         events_skipped=event_skipped,
     )
+
+
+async def _pull_public_calendar_feed_once(feed_url: str) -> Optional[CalendarIngestResponse]:
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.get(feed_url, headers={"accept": "application/json"})
+        if not resp.is_success:
+            logger.warning("Public calendar pull failed (%s): %s", resp.status_code, feed_url)
+            return None
+        payload_json = resp.json()
+        if not isinstance(payload_json, list):
+            logger.warning("Public calendar payload is not a list: %s", feed_url)
+            return None
+        payload = _build_ingest_payload_from_public_feed(
+            feed_url,
+            [item for item in payload_json if isinstance(item, dict)],
+        )
+        if not payload.events:
+            logger.info("Public calendar feed had zero events: %s", feed_url)
+            return CalendarIngestResponse(
+                organizations_inserted=0,
+                organizations_updated=0,
+                events_inserted=0,
+                events_updated=0,
+                events_skipped=0,
+            )
+        session = db.SessionLocal()
+        try:
+            result = _ingest_calendar_payload(session, payload)
+        finally:
+            session.close()
+        logger.info(
+            "Public calendar ingest complete feed=%s org_inserted=%s org_updated=%s event_inserted=%s event_updated=%s skipped=%s",
+            feed_url,
+            result.organizations_inserted,
+            result.organizations_updated,
+            result.events_inserted,
+            result.events_updated,
+            result.events_skipped,
+        )
+        return result
+    except Exception as exc:
+        logger.warning("Public calendar pull failed for %s: %s", feed_url, exc)
+        return None
+
+
+async def _public_calendar_pull_loop() -> None:
+    if not ORG_PUBLIC_CALENDAR_PULL_ENABLED:
+        logger.info("Public calendar pull disabled (ORG_PUBLIC_CALENDAR_PULL_ENABLED=false)")
+        return
+    if not ORG_PUBLIC_CALENDAR_FEEDS:
+        logger.info("Public calendar pull disabled (no ORG_PUBLIC_CALENDAR_FEEDS configured)")
+        return
+    logger.info(
+        "Public calendar pull enabled feeds=%s interval_seconds=%s",
+        ORG_PUBLIC_CALENDAR_FEEDS,
+        ORG_PUBLIC_CALENDAR_PULL_INTERVAL_SECONDS,
+    )
+    while True:
+        for feed_url in ORG_PUBLIC_CALENDAR_FEEDS:
+            await _pull_public_calendar_feed_once(feed_url)
+        await asyncio.sleep(ORG_PUBLIC_CALENDAR_PULL_INTERVAL_SECONDS)
+
+
+@app.post("/api/network/ingest/calendar", response_model=CalendarIngestResponse)
+async def ingest_calendar_feed(
+    payload: CalendarIngestPayload,
+    request: Request,
+    session: Session = Depends(get_db),
+):
+    _require_ingest_auth(request)
+    _throttle_action("network:ingest:calendar", limit=120, window_seconds=3600)
+    return _ingest_calendar_payload(session, payload)
 
 
 @app.get("/api/network/seed", response_model=SeedOrganizationsResponse)
@@ -2235,6 +2960,87 @@ async def list_organizations(
     return [_map_org(org, user_id) for org in organizations]
 
 
+@app.get("/api/network/orgs/public", response_model=List[PublicOrganizationListItemResponse])
+async def list_public_organizations(
+    session: Session = Depends(get_db),
+    q: str = "",
+    limit: int = 250,
+    offset: int = 0,
+    sort: str = Query("popular", pattern="^(popular|name|newest)$"),
+):
+    safe_limit = max(1, min(limit, 1000))
+    safe_offset = max(0, min(offset, 100000))
+    now_utc = datetime.now(timezone.utc)
+
+    membership_counts = (
+        session.query(
+            OrganizationMembership.organization_id.label("organization_id"),
+            func.count(OrganizationMembership.user_id).label("membership_count"),
+        )
+        .group_by(OrganizationMembership.organization_id)
+        .subquery()
+    )
+    upcoming_event_counts = (
+        session.query(
+            NetworkEvent.host_org_id.label("organization_id"),
+            func.count(NetworkEvent.id).label("upcoming_events_count"),
+        )
+        .filter(
+            NetworkEvent.host_org_id.isnot(None),
+            (
+                (NetworkEvent.ends_at.isnot(None) & (NetworkEvent.ends_at >= now_utc))
+                | (NetworkEvent.ends_at.is_(None) & NetworkEvent.starts_at.isnot(None) & (NetworkEvent.starts_at >= now_utc))
+            ),
+        )
+        .group_by(NetworkEvent.host_org_id)
+        .subquery()
+    )
+    pending_claim_counts = (
+        session.query(
+            OrganizationClaimRequest.organization_id.label("organization_id"),
+            func.count(OrganizationClaimRequest.id).label("pending_claim_requests_count"),
+        )
+        .filter(OrganizationClaimRequest.status == "pending")
+        .group_by(OrganizationClaimRequest.organization_id)
+        .subquery()
+    )
+
+    membership_count_col = func.coalesce(membership_counts.c.membership_count, 0)
+    upcoming_events_count_col = func.coalesce(upcoming_event_counts.c.upcoming_events_count, 0)
+    pending_claim_requests_count_col = func.coalesce(pending_claim_counts.c.pending_claim_requests_count, 0)
+    query = (
+        session.query(Organization, membership_count_col, upcoming_events_count_col, pending_claim_requests_count_col)
+        .outerjoin(membership_counts, membership_counts.c.organization_id == Organization.id)
+        .outerjoin(upcoming_event_counts, upcoming_event_counts.c.organization_id == Organization.id)
+        .outerjoin(pending_claim_counts, pending_claim_counts.c.organization_id == Organization.id)
+    )
+    if q.strip():
+        needle = f"%{q.strip()}%"
+        query = query.filter((Organization.name.ilike(needle)) | (Organization.slug.ilike(needle)))
+
+    if sort == "name":
+        query = query.order_by(Organization.name.asc())
+    elif sort == "newest":
+        query = query.order_by(Organization.created_at.desc(), Organization.name.asc())
+    else:
+        query = query.order_by(
+            membership_count_col.desc(),
+            upcoming_events_count_col.desc(),
+            Organization.name.asc(),
+        )
+
+    rows = query.offset(safe_offset).limit(safe_limit).all()
+    return [
+        _map_public_org_list_item(
+            org=org,
+            membership_count=membership_count,
+            upcoming_events_count=upcoming_events_count,
+            pending_claim_requests_count=pending_claim_requests_count,
+        )
+        for org, membership_count, upcoming_events_count, pending_claim_requests_count in rows
+    ]
+
+
 @app.get("/api/network/orgs/public/{slug}", response_model=PublicOrganizationResponse)
 async def get_public_organization(
     slug: str,
@@ -2243,8 +3049,83 @@ async def get_public_organization(
     normalized = slug.strip().lower()
     org = session.query(Organization).filter(Organization.slug == normalized).first()
     if not org:
+        merged_redirect = (
+            session.query(NetworkAuditEvent)
+            .filter(
+                NetworkAuditEvent.event_type == "org.merged",
+                NetworkAuditEvent.metadata_json["source_slug"].astext == normalized,
+            )
+            .order_by(NetworkAuditEvent.created_at.desc())
+            .first()
+        )
+        target_slug = None
+        if merged_redirect and isinstance(merged_redirect.metadata_json, dict):
+            target_slug = str(merged_redirect.metadata_json.get("target_slug") or "").strip().lower() or None
+        if target_slug:
+            redirected_org = session.query(Organization).filter(Organization.slug == target_slug).first()
+            if redirected_org:
+                return _map_public_org(redirected_org, session, redirected_from_slug=normalized)
         raise HTTPException(status_code=404, detail="Organization not found")
     return _map_public_org(org, session)
+
+
+@app.get("/api/network/orgs/public/{slug}/admins", response_model=List[PublicOrganizationAdminResponse])
+async def list_public_organization_admins(
+    slug: str,
+    session: Session = Depends(get_db),
+):
+    normalized = slug.strip().lower()
+    org = session.query(Organization).filter(Organization.slug == normalized).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    admins: list[PublicOrganizationAdminResponse] = []
+    seen_user_ids: set[str] = set()
+    for member in org.memberships or []:
+        if member.role != "admin":
+            continue
+        seen_user_ids.add(member.user_id)
+        admins.append(
+            PublicOrganizationAdminResponse(
+                user_id=member.user_id,
+                user_name=member.user_name,
+                user_email=member.user_email,
+                role="admin",
+            )
+        )
+
+    if org.claimed_by_user_id and org.claimed_by_user_id not in seen_user_ids:
+        admins.append(
+            PublicOrganizationAdminResponse(
+                user_id=org.claimed_by_user_id,
+                user_name=None,
+                user_email=None,
+                role="owner",
+            )
+        )
+
+    return admins
+
+
+@app.post("/api/network/orgs/public/{slug}/claim", response_model=OrganizationResponse)
+async def claim_public_organization(
+    slug: str,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user)
+    _throttle_action(f"network:claim-org:{user_id}", limit=20, window_seconds=3600)
+
+    normalized = slug.strip().lower()
+    org = session.query(Organization).filter(Organization.slug == normalized).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    _claim_org_record(session, org, current_user)
+    session.commit()
+    session.refresh(org)
+    return _map_org(org, user_id)
 
 
 @app.get("/api/network/orgs/public/{slug}/events", response_model=List[NetworkEventResponse])
@@ -2292,7 +3173,7 @@ async def create_organization(
 
     source_url = _validate_public_url(payload.source_url, "source_url")
     if source_url:
-        existing = session.query(Organization).filter(Organization.source_url == source_url).first()
+        existing = _find_org_by_source_url(session, source_url)
         if existing:
             raise HTTPException(status_code=409, detail="Organization for this source URL already exists")
 
@@ -2303,6 +3184,7 @@ async def create_organization(
         slug=slug,
         description=payload.description,
         source_url=source_url,
+        source_urls=[source_url] if source_url else [],
         image_url=_validate_public_url(payload.image_url, "image_url"),
         tags=payload.tags or [],
         seeded_from_events=False,
@@ -2345,41 +3227,64 @@ async def claim_organization(
     org = session.query(Organization).filter(Organization.id == organization_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
-    if org.claimed_by_user_id and org.claimed_by_user_id != user_id:
-        raise HTTPException(status_code=409, detail="Organization is already claimed")
+    _claim_org_record(session, org, current_user)
+    session.commit()
+    session.refresh(org)
+    return _map_org(org, user_id)
 
-    org.claimed_by_user_id = user_id
-    if not org.created_by_user_id:
-        org.created_by_user_id = user_id
-    membership = (
-        session.query(OrganizationMembership)
-        .filter(
-            OrganizationMembership.organization_id == org.id,
-            OrganizationMembership.user_id == user_id,
-        )
-        .first()
-    )
-    if not membership:
-        membership = OrganizationMembership(
-            id=uuid.uuid4(),
-            organization=org,
-            user_id=user_id,
-            user_email=current_user.get("email"),
-            user_name=current_user.get("name"),
-            role="admin",
-        )
-        session.add(membership)
-    else:
-        membership.role = "admin"
-        membership.user_email = current_user.get("email")
-        membership.user_name = current_user.get("name")
+
+@app.patch("/api/network/orgs/{organization_id}", response_model=OrganizationResponse)
+async def update_organization(
+    organization_id: uuid.UUID,
+    payload: OrganizationUpdate,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user)
+    _throttle_action(f"network:update-org:{user_id}", limit=80, window_seconds=3600)
+    org = session.query(Organization).filter(Organization.id == organization_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    if not _is_org_admin(org, current_user):
+        raise HTTPException(status_code=403, detail="Organization admin access required")
+
+    changed_fields: List[str] = []
+
+    if payload.name is not None:
+        next_name = payload.name.strip()
+        if not next_name:
+            raise HTTPException(status_code=422, detail="Organization name cannot be empty")
+        if next_name != org.name:
+            org.name = next_name
+            changed_fields.append("name")
+    if payload.description is not None:
+        next_description = payload.description.strip() or None
+        if next_description != org.description:
+            org.description = next_description
+            changed_fields.append("description")
+    if payload.image_url is not None:
+        next_image_url = _validate_public_url(payload.image_url.strip() or None, "image_url")
+        if next_image_url != org.image_url:
+            org.image_url = next_image_url
+            changed_fields.append("image_url")
+    if payload.tags is not None:
+        next_tags = sorted(set((payload.tags or [])))
+        if next_tags != (org.tags or []):
+            org.tags = next_tags
+            changed_fields.append("tags")
+
+    if not changed_fields:
+        return _map_org(org, user_id)
+
+    org.updated_at = datetime.now(timezone.utc)
     _audit_event(
         session,
         actor=current_user,
-        event_type="org.claimed",
+        event_type="org.updated",
         target_type="organization",
         target_id=str(org.id),
-        metadata={"claimed_by": user_id},
+        metadata={"changed_fields": changed_fields},
     )
     session.commit()
     session.refresh(org)
@@ -2415,6 +3320,122 @@ async def unclaim_organization(
     session.commit()
     session.refresh(org)
     return _map_org(org, user_id)
+
+
+@app.post("/api/network/orgs/{organization_id}/merge", response_model=OrganizationResponse)
+async def merge_organization(
+    organization_id: uuid.UUID,
+    payload: OrganizationMergeRequest,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user)
+    _throttle_action(f"network:merge-org:{user_id}", limit=40, window_seconds=3600)
+
+    target_org = session.query(Organization).filter(Organization.id == organization_id).first()
+    if not target_org:
+        raise HTTPException(status_code=404, detail="Target organization not found")
+    source_org = session.query(Organization).filter(Organization.id == payload.source_organization_id).first()
+    if not source_org:
+        raise HTTPException(status_code=404, detail="Source organization not found")
+    if target_org.id == source_org.id:
+        raise HTTPException(status_code=422, detail="Source and target organizations must be different")
+
+    if not _is_org_admin(target_org, current_user):
+        raise HTTPException(status_code=403, detail="Target organization admin access required")
+    if not _can_manage_org_for_merge(source_org, current_user):
+        raise HTTPException(status_code=403, detail="Source organization is claimed by another admin")
+
+    # Merge source URLs and keep canonical target source_url stable.
+    merged_source_urls = _org_source_urls(target_org)
+    for url in _org_source_urls(source_org):
+        if url not in merged_source_urls:
+            merged_source_urls.append(url)
+    _set_org_source_urls(target_org, merged_source_urls)
+
+    # Merge descriptive fields without clobbering richer manual data.
+    if not target_org.description and source_org.description:
+        target_org.description = source_org.description
+    if not target_org.image_url and source_org.image_url:
+        target_org.image_url = source_org.image_url
+    target_org.tags = sorted(set((target_org.tags or []) + (source_org.tags or [])))
+    target_org.seeded_from_events = bool(target_org.seeded_from_events or source_org.seeded_from_events)
+    if not target_org.created_by_user_id and source_org.created_by_user_id:
+        target_org.created_by_user_id = source_org.created_by_user_id
+    if not target_org.claimed_by_user_id and source_org.claimed_by_user_id:
+        target_org.claimed_by_user_id = source_org.claimed_by_user_id
+
+    # Move hosted events.
+    source_events = session.query(NetworkEvent).filter(NetworkEvent.host_org_id == source_org.id).all()
+    for event in source_events:
+        event.host_org = target_org
+        event.host_type = EventHostType.ORG.value
+        event.host_user_id = None
+        event.updated_at = datetime.now(timezone.utc)
+
+    # Merge memberships, upgrading role to admin if either side is admin.
+    target_members = {
+        member.user_id: member
+        for member in session.query(OrganizationMembership).filter(OrganizationMembership.organization_id == target_org.id).all()
+    }
+    source_members = session.query(OrganizationMembership).filter(OrganizationMembership.organization_id == source_org.id).all()
+    for source_member in source_members:
+        existing_member = target_members.get(source_member.user_id)
+        if existing_member:
+            if source_member.role == "admin":
+                existing_member.role = "admin"
+            if not existing_member.user_email and source_member.user_email:
+                existing_member.user_email = source_member.user_email
+            if not existing_member.user_name and source_member.user_name:
+                existing_member.user_name = source_member.user_name
+            existing_member.updated_at = datetime.now(timezone.utc)
+            session.delete(source_member)
+            continue
+
+        source_member.organization_id = target_org.id
+        source_member.updated_at = datetime.now(timezone.utc)
+        target_members[source_member.user_id] = source_member
+
+    previous_target_claimed_by = target_org.claimed_by_user_id
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="org.merged",
+        target_type="organization",
+        target_id=str(target_org.id),
+        metadata={
+            "source_organization_id": str(source_org.id),
+            "source_slug": source_org.slug,
+            "target_slug": target_org.slug,
+            "events_reassigned": len(source_events),
+            "target_claimed_by_before": previous_target_claimed_by,
+            "target_claimed_by_after": target_org.claimed_by_user_id,
+            "source_urls": _org_source_urls(source_org),
+            "merged_source_urls": _org_source_urls(target_org),
+        },
+    )
+
+    # Flush before delete so relationship rebinding is persisted and no hosted events
+    # remain attached to source_org in this transaction.
+    session.flush()
+    remaining_source_events = (
+        session.query(NetworkEvent.id)
+        .filter(NetworkEvent.host_org_id == source_org.id)
+        .limit(1)
+        .all()
+    )
+    if remaining_source_events:
+        raise HTTPException(
+            status_code=409,
+            detail="Organization merge blocked: source organization still has bound hosted events.",
+        )
+
+    session.delete(source_org)
+    target_org.updated_at = datetime.now(timezone.utc)
+    session.commit()
+    session.refresh(target_org)
+    return _map_org(target_org, user_id)
 
 
 @app.get("/api/network/events", response_model=List[NetworkEventResponse])
@@ -2880,6 +3901,54 @@ async def list_claim_requests(
     return query.order_by(OrganizationClaimRequest.created_at.desc()).all()
 
 
+@app.get("/api/network/claim-requests", response_model=List[OrganizationClaimRequestQueueItemResponse])
+async def list_claim_requests_queue(
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+    status_filter: str = Query("pending", alias="status"),
+    limit: int = 200,
+):
+    _require_authenticated_user(current_user)
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+    normalized_status = (status_filter or "pending").strip().lower()
+    if normalized_status not in {"pending", "approved", "rejected", "all"}:
+        raise HTTPException(status_code=422, detail="status must be one of: pending, approved, rejected, all")
+    safe_limit = max(1, min(limit, 1000))
+
+    query = (
+        session.query(OrganizationClaimRequest, Organization)
+        .join(Organization, Organization.id == OrganizationClaimRequest.organization_id)
+    )
+    if normalized_status != "all":
+        query = query.filter(OrganizationClaimRequest.status == normalized_status)
+
+    rows = (
+        query.order_by(OrganizationClaimRequest.created_at.desc(), OrganizationClaimRequest.id.desc())
+        .limit(safe_limit)
+        .all()
+    )
+    return [
+        OrganizationClaimRequestQueueItemResponse(
+            id=claim.id,
+            organization_id=org.id,
+            organization_name=org.name,
+            organization_slug=org.slug,
+            organization_claimed_by_user_id=org.claimed_by_user_id,
+            requested_by_user_id=claim.requested_by_user_id,
+            requested_by_email=claim.requested_by_email,
+            requested_by_name=claim.requested_by_name,
+            message=claim.message,
+            status=claim.status,
+            reviewed_by_user_id=claim.reviewed_by_user_id,
+            reviewed_at=claim.reviewed_at,
+            created_at=claim.created_at,
+        )
+        for claim, org in rows
+    ]
+
+
 @app.post("/api/network/claim-requests/{claim_request_id}/approve", response_model=OrganizationResponse)
 async def approve_claim_request(
     claim_request_id: uuid.UUID,
@@ -3020,7 +4089,7 @@ def _default_contact_slug(current_user: dict) -> str:
 def _map_contact(contact: UserContactPage, request: Optional[Request]) -> ContactPageResponse:
     public_url = None
     if request:
-        public_url = f"{str(request.base_url).rstrip('/')}/contact/{contact.slug}"
+        public_url = f"{str(request.base_url).rstrip('/')}/users/{contact.slug}"
     links = []
     for raw in (contact.links or []):
         if isinstance(raw, dict) and raw.get("label") and raw.get("url"):
@@ -3039,6 +4108,58 @@ def _map_contact(contact: UserContactPage, request: Optional[Request]) -> Contac
         website_url=contact.website_url,
         links=links,
         public_url=public_url,
+        updated_at=contact.updated_at,
+    )
+
+
+def _map_public_user_profile(contact: UserContactPage, request: Optional[Request], session: Session) -> PublicUserProfileResponse:
+    public_url = None
+    if request:
+        public_url = f"{str(request.base_url).rstrip('/')}/users/{contact.slug}"
+    links: list[ContactLink] = []
+    for raw in (contact.links or []):
+        if isinstance(raw, dict) and raw.get("label") and raw.get("url"):
+            links.append(ContactLink(label=str(raw["label"]), url=str(raw["url"])))
+
+    now_utc = datetime.now(timezone.utc)
+    upcoming_events_count = (
+        session.query(NetworkEvent)
+        .filter(
+            NetworkEvent.host_type == EventHostType.INDIVIDUAL.value,
+            NetworkEvent.host_user_id == contact.user_id,
+            (
+                (NetworkEvent.ends_at.isnot(None) & (NetworkEvent.ends_at >= now_utc))
+                | (NetworkEvent.ends_at.is_(None) & NetworkEvent.starts_at.isnot(None) & (NetworkEvent.starts_at >= now_utc))
+            ),
+        )
+        .count()
+    )
+    return PublicUserProfileResponse(
+        user_id=contact.user_id,
+        user_name=contact.user_name or "User",
+        slug=contact.slug,
+        headline=contact.headline,
+        bio=contact.bio,
+        photo_url=contact.photo_url,
+        email_public=contact.email_public,
+        phone_public=contact.phone_public,
+        linkedin_url=contact.linkedin_url,
+        website_url=contact.website_url,
+        links=links,
+        public_url=public_url,
+        upcoming_events_count=upcoming_events_count,
+        updated_at=contact.updated_at,
+    )
+
+
+def _map_public_user_list_item(contact: UserContactPage, upcoming_events_count: int) -> PublicUserListItemResponse:
+    return PublicUserListItemResponse(
+        user_id=contact.user_id,
+        user_name=contact.user_name or "User",
+        slug=contact.slug,
+        headline=contact.headline,
+        photo_url=contact.photo_url,
+        upcoming_events_count=int(upcoming_events_count or 0),
         updated_at=contact.updated_at,
     )
 
@@ -3148,6 +4269,114 @@ async def get_public_contact_page(
     if not contact or not contact.enabled:
         raise HTTPException(status_code=404, detail="Contact page not found")
     return _map_contact(contact, request)
+
+
+@app.get("/api/network/users/public", response_model=List[PublicUserListItemResponse])
+async def list_public_user_profiles(
+    session: Session = Depends(get_db),
+    q: str = "",
+    limit: int = 120,
+    offset: int = 0,
+    sort: str = Query("popular", pattern="^(popular|name|recent)$"),
+):
+    safe_limit = max(1, min(limit, 500))
+    safe_offset = max(0, min(offset, 100000))
+    now_utc = datetime.now(timezone.utc)
+
+    upcoming_event_counts = (
+        session.query(
+            NetworkEvent.host_user_id.label("user_id"),
+            func.count(NetworkEvent.id).label("upcoming_events_count"),
+        )
+        .filter(
+            NetworkEvent.host_type == EventHostType.INDIVIDUAL.value,
+            NetworkEvent.host_user_id.isnot(None),
+            (
+                (NetworkEvent.ends_at.isnot(None) & (NetworkEvent.ends_at >= now_utc))
+                | (NetworkEvent.ends_at.is_(None) & NetworkEvent.starts_at.isnot(None) & (NetworkEvent.starts_at >= now_utc))
+            ),
+        )
+        .group_by(NetworkEvent.host_user_id)
+        .subquery()
+    )
+
+    upcoming_events_count_col = func.coalesce(upcoming_event_counts.c.upcoming_events_count, 0)
+    query = (
+        session.query(UserContactPage, upcoming_events_count_col)
+        .outerjoin(upcoming_event_counts, upcoming_event_counts.c.user_id == UserContactPage.user_id)
+        .filter(UserContactPage.enabled.is_(True))
+    )
+
+    if q.strip():
+        needle = f"%{q.strip()}%"
+        query = query.filter(
+            (UserContactPage.user_name.ilike(needle))
+            | (UserContactPage.slug.ilike(needle))
+            | (UserContactPage.headline.ilike(needle))
+            | (UserContactPage.bio.ilike(needle))
+        )
+
+    if sort == "name":
+        query = query.order_by(UserContactPage.user_name.asc(), UserContactPage.slug.asc())
+    elif sort == "recent":
+        query = query.order_by(UserContactPage.updated_at.desc(), UserContactPage.user_name.asc())
+    else:
+        query = query.order_by(
+            upcoming_events_count_col.desc(),
+            UserContactPage.updated_at.desc(),
+            UserContactPage.user_name.asc(),
+        )
+
+    rows = query.offset(safe_offset).limit(safe_limit).all()
+    return [
+        _map_public_user_list_item(contact=contact, upcoming_events_count=upcoming_events_count)
+        for contact, upcoming_events_count in rows
+    ]
+
+
+@app.get("/api/network/users/public/{slug}", response_model=PublicUserProfileResponse)
+async def get_public_user_profile(
+    slug: str,
+    request: Request,
+    session: Session = Depends(get_db),
+):
+    contact = session.query(UserContactPage).filter(UserContactPage.slug == _slugify(slug)).first()
+    if not contact or not contact.enabled:
+        raise HTTPException(status_code=404, detail="Public user profile not found")
+    return _map_public_user_profile(contact, request, session)
+
+
+@app.get("/api/network/users/public/{slug}/events", response_model=List[NetworkEventResponse])
+async def list_public_user_events(
+    slug: str,
+    session: Session = Depends(get_db),
+    upcoming_only: bool = True,
+    limit: int = 60,
+    offset: int = 0,
+):
+    contact = session.query(UserContactPage).filter(UserContactPage.slug == _slugify(slug)).first()
+    if not contact or not contact.enabled:
+        raise HTTPException(status_code=404, detail="Public user profile not found")
+
+    safe_limit = max(1, min(limit, 200))
+    safe_offset = max(0, min(offset, 100000))
+    now_utc = datetime.now(timezone.utc)
+    query = (
+        session.query(NetworkEvent)
+        .filter(
+            NetworkEvent.host_type == EventHostType.INDIVIDUAL.value,
+            NetworkEvent.host_user_id == contact.user_id,
+        )
+        .order_by(NetworkEvent.starts_at.asc().nullslast(), NetworkEvent.created_at.desc())
+    )
+    if upcoming_only:
+        query = query.filter(
+            (NetworkEvent.ends_at.isnot(None) & (NetworkEvent.ends_at >= now_utc))
+            | (NetworkEvent.ends_at.is_(None) & NetworkEvent.starts_at.isnot(None) & (NetworkEvent.starts_at >= now_utc))
+        )
+
+    events = query.offset(safe_offset).limit(safe_limit).all()
+    return [_map_network_event(event, None, session) for event in events]
 
 # ============= ACCOUNT ENDPOINTS =============
 
@@ -4577,6 +5806,426 @@ async def check_and_process_proposals():
                 logger.error(f"Failed to process proposals: {e}")
         
         await asyncio.sleep(300)  # Check every 5 minutes
+
+# ============= GOVERNANCE API =============
+
+def _governance_actor_name(current_user: dict) -> str:
+    return (
+        str(current_user.get("name") or "").strip()
+        or str(current_user.get("email") or "").strip()
+        or _actor_user_id(current_user)
+        or "Unknown"
+    )
+
+
+def _get_governance_motion_or_404(session: Session, motion_id: uuid.UUID) -> GovernanceMotion:
+    motion = session.query(GovernanceMotion).filter(GovernanceMotion.id == motion_id).first()
+    if not motion:
+        raise HTTPException(status_code=404, detail="Motion not found")
+    return motion
+
+
+@app.get("/api/governance/motions", response_model=List[GovernanceMotionResponse])
+async def list_governance_motions(
+    session: Session = Depends(get_db),
+    search: str = Query("", alias="search"),
+    status: Optional[List[str]] = Query(None, alias="status"),
+    type: Optional[str] = Query(None, alias="type"),
+    parent_motion_id: Optional[uuid.UUID] = Query(None, alias="parent_motion_id"),
+):
+    query = session.query(GovernanceMotion)
+    needle = (search or "").strip()
+    if needle:
+        like = f"%{needle}%"
+        query = query.filter(
+            (GovernanceMotion.title.ilike(like))
+            | (GovernanceMotion.body.ilike(like))
+            | (GovernanceMotion.proposer_name.ilike(like))
+        )
+    if status:
+        allowed_statuses = {
+            GovernanceMotionStatus.PROPOSED.value,
+            GovernanceMotionStatus.SECONDED.value,
+            GovernanceMotionStatus.DISCUSSION.value,
+            GovernanceMotionStatus.VOTING.value,
+            GovernanceMotionStatus.PASSED.value,
+            GovernanceMotionStatus.FAILED.value,
+            GovernanceMotionStatus.TABLED.value,
+            GovernanceMotionStatus.WITHDRAWN.value,
+        }
+        statuses = [item for item in status if item in allowed_statuses]
+        if statuses:
+            query = query.filter(GovernanceMotion.status.in_(statuses))
+    if type:
+        if type not in {GovernanceMotionType.MAIN.value, GovernanceMotionType.AMENDMENT.value}:
+            raise HTTPException(status_code=422, detail="Invalid type filter")
+        query = query.filter(GovernanceMotion.type == type)
+    if parent_motion_id:
+        query = query.filter(GovernanceMotion.parent_motion_id == parent_motion_id)
+
+    rows = query.order_by(GovernanceMotion.created_at.desc()).all()
+    return [_map_governance_motion(row) for row in rows]
+
+
+@app.get("/api/governance/motions/{motion_id}", response_model=GovernanceMotionResponse)
+async def get_governance_motion(
+    motion_id: uuid.UUID,
+    session: Session = Depends(get_db),
+):
+    motion = _get_governance_motion_or_404(session, motion_id)
+    return _map_governance_motion(motion)
+
+
+@app.post("/api/governance/motions", response_model=GovernanceMotionResponse)
+async def create_governance_motion(
+    payload: GovernanceMotionCreate,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user)
+    _throttle_action(f"governance:create-motion:{user_id}", limit=40, window_seconds=3600)
+
+    if payload.type == GovernanceMotionType.AMENDMENT.value and not payload.parent_motion_id:
+        raise HTTPException(status_code=422, detail="parent_motion_id is required for amendments")
+    if payload.type == GovernanceMotionType.MAIN.value and payload.parent_motion_id:
+        raise HTTPException(status_code=422, detail="parent_motion_id is only valid for amendments")
+
+    if payload.parent_motion_id:
+        _get_governance_motion_or_404(session, payload.parent_motion_id)
+
+    proposer_name = _governance_actor_name(current_user)
+    proposer_user_name = proposer_name
+    proposer_org_name = None
+    proposer_org_id = None
+
+    if payload.proposer_type == GovernanceProposerType.ORG.value:
+        if not payload.proposer_org_id:
+            raise HTTPException(status_code=422, detail="proposer_org_id is required for org proposer type")
+        org = session.query(Organization).filter(Organization.id == payload.proposer_org_id).first()
+        if not org:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        if not _is_org_admin(org, current_user):
+            raise HTTPException(status_code=403, detail="Organization admin access required")
+        proposer_name = org.name
+        proposer_org_name = org.name
+        proposer_org_id = org.id
+
+    motion = GovernanceMotion(
+        id=uuid.uuid4(),
+        type=payload.type,
+        parent_motion_id=payload.parent_motion_id,
+        title=payload.title.strip(),
+        body=payload.body.strip(),
+        proposed_body_diff=(payload.proposed_body_diff or "").strip() or None,
+        status=GovernanceMotionStatus.PROPOSED.value,
+        proposer_type=payload.proposer_type,
+        proposer_user_id=user_id,
+        proposer_name=proposer_name,
+        proposer_user_name=proposer_user_name,
+        proposer_org_id=proposer_org_id,
+        proposer_org_name=proposer_org_name,
+        quorum_required=int(payload.quorum_required),
+    )
+    session.add(motion)
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="governance.motion.created",
+        target_type="governance_motion",
+        target_id=str(motion.id),
+        metadata={
+            "motion_type": motion.type,
+            "proposer_type": motion.proposer_type,
+            "proposer_org_id": str(motion.proposer_org_id) if motion.proposer_org_id else None,
+        },
+    )
+    session.commit()
+    session.refresh(motion)
+    return _map_governance_motion(motion)
+
+
+@app.post("/api/governance/motions/{motion_id}/second", response_model=GovernanceMotionResponse)
+async def second_governance_motion(
+    motion_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    motion = _get_governance_motion_or_404(session, motion_id)
+    user_id = _actor_user_id(current_user)
+    if motion.status != GovernanceMotionStatus.PROPOSED.value:
+        raise HTTPException(status_code=400, detail="Motion must be in proposed status to second")
+    if motion.proposer_user_id == user_id:
+        raise HTTPException(status_code=400, detail="Proposer cannot second their own motion")
+    motion.seconder_id = user_id
+    motion.seconder_name = _governance_actor_name(current_user)
+    motion.status = GovernanceMotionStatus.DISCUSSION.value
+    motion.discussion_deadline = datetime.now(timezone.utc) + timedelta(days=2)
+    motion.updated_at = datetime.now(timezone.utc)
+    session.commit()
+    session.refresh(motion)
+    return _map_governance_motion(motion)
+
+
+@app.post("/api/governance/motions/{motion_id}/open-voting", response_model=GovernanceMotionResponse)
+async def open_governance_motion_voting(
+    motion_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    motion = _get_governance_motion_or_404(session, motion_id)
+    if not _can_manage_governance_motion(motion, current_user, session):
+        raise HTTPException(status_code=403, detail="Motion management access required")
+    if motion.status != GovernanceMotionStatus.DISCUSSION.value:
+        raise HTTPException(status_code=400, detail="Motion must be in discussion status")
+    _ensure_governance_transition(motion, GovernanceMotionStatus.VOTING.value)
+    motion.status = GovernanceMotionStatus.VOTING.value
+    motion.voting_deadline = datetime.now(timezone.utc) + timedelta(days=1)
+    motion.updated_at = datetime.now(timezone.utc)
+    session.commit()
+    session.refresh(motion)
+    return _map_governance_motion(motion)
+
+
+@app.post("/api/governance/motions/{motion_id}/table", response_model=GovernanceMotionResponse)
+async def table_governance_motion(
+    motion_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    motion = _get_governance_motion_or_404(session, motion_id)
+    if not _can_manage_governance_motion(motion, current_user, session):
+        raise HTTPException(status_code=403, detail="Motion management access required")
+    if motion.status != GovernanceMotionStatus.DISCUSSION.value:
+        raise HTTPException(status_code=400, detail="Motion must be in discussion status")
+    _ensure_governance_transition(motion, GovernanceMotionStatus.TABLED.value)
+    motion.status = GovernanceMotionStatus.TABLED.value
+    motion.updated_at = datetime.now(timezone.utc)
+    session.commit()
+    session.refresh(motion)
+    return _map_governance_motion(motion)
+
+
+@app.post("/api/governance/motions/{motion_id}/withdraw", response_model=GovernanceMotionResponse)
+async def withdraw_governance_motion(
+    motion_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    motion = _get_governance_motion_or_404(session, motion_id)
+    user_id = _actor_user_id(current_user)
+    if motion.proposer_user_id != user_id and not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Only the proposer or an admin can withdraw this motion")
+    if motion.status != GovernanceMotionStatus.PROPOSED.value:
+        raise HTTPException(status_code=400, detail="Only proposed motions can be withdrawn")
+    _ensure_governance_transition(motion, GovernanceMotionStatus.WITHDRAWN.value)
+    motion.status = GovernanceMotionStatus.WITHDRAWN.value
+    motion.updated_at = datetime.now(timezone.utc)
+    session.commit()
+    session.refresh(motion)
+    return _map_governance_motion(motion)
+
+
+@app.post("/api/governance/motions/{motion_id}/resolve", response_model=GovernanceMotionResponse)
+async def resolve_governance_motion(
+    motion_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    motion = _get_governance_motion_or_404(session, motion_id)
+    if not _can_manage_governance_motion(motion, current_user, session):
+        raise HTTPException(status_code=403, detail="Motion management access required")
+    if motion.status != GovernanceMotionStatus.VOTING.value:
+        raise HTTPException(status_code=400, detail="Motion must be in voting status")
+    result = _governance_vote_result(motion)
+    next_status = GovernanceMotionStatus.PASSED.value if result["passed"] else GovernanceMotionStatus.FAILED.value
+    _ensure_governance_transition(motion, next_status)
+    motion.status = next_status
+    motion.updated_at = datetime.now(timezone.utc)
+    session.commit()
+    session.refresh(motion)
+    return _map_governance_motion(motion)
+
+
+@app.post("/api/governance/motions/{motion_id}/votes", response_model=GovernanceMotionResponse)
+async def cast_governance_motion_vote(
+    motion_id: uuid.UUID,
+    payload: GovernanceMotionVoteCastRequest,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    motion = _get_governance_motion_or_404(session, motion_id)
+    if motion.status != GovernanceMotionStatus.VOTING.value:
+        raise HTTPException(status_code=400, detail="Motion is not open for voting")
+    user_id = _actor_user_id(current_user)
+    existing = (
+        session.query(GovernanceVote)
+        .filter(
+            GovernanceVote.motion_id == motion.id,
+            GovernanceVote.voter_user_id == user_id,
+        )
+        .first()
+    )
+    if existing:
+        existing.choice = payload.choice
+        existing.voter_name = _governance_actor_name(current_user)
+        existing.cast_at = datetime.now(timezone.utc)
+    else:
+        session.add(
+            GovernanceVote(
+                id=uuid.uuid4(),
+                motion_id=motion.id,
+                voter_user_id=user_id,
+                voter_name=_governance_actor_name(current_user),
+                choice=payload.choice,
+            )
+        )
+    motion.updated_at = datetime.now(timezone.utc)
+    session.commit()
+    session.refresh(motion)
+    return _map_governance_motion(motion)
+
+
+@app.get("/api/governance/motions/{motion_id}/comments", response_model=List[GovernanceCommentResponse])
+async def list_governance_motion_comments(
+    motion_id: uuid.UUID,
+    session: Session = Depends(get_db),
+):
+    _get_governance_motion_or_404(session, motion_id)
+    rows = (
+        session.query(GovernanceComment)
+        .filter(GovernanceComment.motion_id == motion_id)
+        .order_by(GovernanceComment.created_at.asc())
+        .all()
+    )
+    return rows
+
+
+@app.post("/api/governance/motions/{motion_id}/comments", response_model=GovernanceCommentResponse)
+async def create_governance_motion_comment(
+    motion_id: uuid.UUID,
+    payload: GovernanceCommentCreate,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    _get_governance_motion_or_404(session, motion_id)
+    row = GovernanceComment(
+        id=uuid.uuid4(),
+        motion_id=motion_id,
+        author_id=_actor_user_id(current_user),
+        author_name=_governance_actor_name(current_user),
+        body=payload.body.strip(),
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+def _set_governance_reaction(
+    motion: GovernanceMotion,
+    current_user: dict,
+    session: Session,
+    direction: str,
+) -> GovernanceReactionResponse:
+    user_id = _actor_user_id(current_user)
+    existing = (
+        session.query(GovernanceReaction)
+        .filter(
+            GovernanceReaction.motion_id == motion.id,
+            GovernanceReaction.user_id == user_id,
+        )
+        .first()
+    )
+    if existing and existing.direction == direction:
+        session.delete(existing)
+        user_vote = None
+    elif existing:
+        existing.direction = direction
+        existing.updated_at = datetime.now(timezone.utc)
+        user_vote = direction
+    else:
+        session.add(
+            GovernanceReaction(
+                id=uuid.uuid4(),
+                motion_id=motion.id,
+                user_id=user_id,
+                direction=direction,
+            )
+        )
+        user_vote = direction
+    motion.updated_at = datetime.now(timezone.utc)
+    session.commit()
+    session.refresh(motion)
+    counts = _governance_reaction_counts(motion)
+    return GovernanceReactionResponse(score=counts.score, user_vote=user_vote)
+
+
+@app.post("/api/governance/motions/{motion_id}/upvote", response_model=GovernanceReactionResponse)
+async def upvote_governance_motion(
+    motion_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    motion = _get_governance_motion_or_404(session, motion_id)
+    return _set_governance_reaction(motion, current_user, session, GovernanceReactionType.UP.value)
+
+
+@app.post("/api/governance/motions/{motion_id}/downvote", response_model=GovernanceReactionResponse)
+async def downvote_governance_motion(
+    motion_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    motion = _get_governance_motion_or_404(session, motion_id)
+    return _set_governance_reaction(motion, current_user, session, GovernanceReactionType.DOWN.value)
+
+
+@app.get("/api/governance/motions/{motion_id}/user-vote", response_model=GovernanceUserVoteResponse)
+async def get_governance_motion_user_vote(
+    motion_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    _get_governance_motion_or_404(session, motion_id)
+    user_id = _actor_user_id(current_user)
+    row = (
+        session.query(GovernanceReaction)
+        .filter(
+            GovernanceReaction.motion_id == motion_id,
+            GovernanceReaction.user_id == user_id,
+        )
+        .first()
+    )
+    return GovernanceUserVoteResponse(user_vote=row.direction if row else None)
+
+
+@app.get("/api/governance/motions/{motion_id}/vote-counts", response_model=GovernanceVoteCountsResponse)
+async def get_governance_motion_vote_counts(
+    motion_id: uuid.UUID,
+    session: Session = Depends(get_db),
+):
+    motion = _get_governance_motion_or_404(session, motion_id)
+    return _governance_reaction_counts(motion)
+
+
+@app.get("/api/governance/motions/{motion_id}/results", response_model=GovernanceVoteResultResponse)
+async def get_governance_motion_results(
+    motion_id: uuid.UUID,
+    session: Session = Depends(get_db),
+):
+    motion = _get_governance_motion_or_404(session, motion_id)
+    return GovernanceVoteResultResponse(**_governance_vote_result(motion))
 
 # ============= STARTUP TASKS =============
 

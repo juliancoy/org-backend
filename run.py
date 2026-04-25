@@ -180,6 +180,18 @@ def _common_env(
         "FRONTEND_URL": os.getenv("FRONTEND_URL", frontend_host or ""),
         "ORG_BACKEND_URL": os.getenv("ORG_BACKEND_URL", ""),
         "ORG_INGEST_TOKEN": os.getenv("ORG_INGEST_TOKEN", ""),
+        "ORG_PUBLIC_CALENDAR_FEEDS": os.getenv(
+            "ORG_PUBLIC_CALENDAR_FEEDS",
+            "https://codecollective.us/baltimore/upcoming_events.json",
+        ),
+        "ORG_PUBLIC_CALENDAR_PULL_INTERVAL_SECONDS": os.getenv(
+            "ORG_PUBLIC_CALENDAR_PULL_INTERVAL_SECONDS",
+            "900",
+        ),
+        "ORG_PUBLIC_CALENDAR_PULL_ENABLED": os.getenv(
+            "ORG_PUBLIC_CALENDAR_PULL_ENABLED",
+            "true",
+        ),
         "WATCHFILES_FORCE_POLLING": "true",
     }
 
