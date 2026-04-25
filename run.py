@@ -57,7 +57,11 @@ def _ensure_prod_image_available(requested_image: str) -> tuple[str, str]:
         pull_proc = subprocess.run(["docker", "pull", requested_image])
         if pull_proc.returncode == 0:
             return requested_image, "pulled"
-        print(f"Warning: failed to pull prod image {requested_image}")
+        print(
+            f"Warning: failed to pull prod image {requested_image}. "
+            "Ensure org-backend release workflow has published this tag and "
+            "the GHCR package is readable by this host."
+        )
     else:
         print("Skipping prod image pull because ORG_SKIP_PROD_PULL is enabled")
 
@@ -87,7 +91,8 @@ def _ensure_prod_image_available(requested_image: str) -> tuple[str, str]:
     raise RuntimeError(
         "Unable to start org prod container: registry pull failed and no local image exists. "
         "Either make image readable, run `docker login ghcr.io`, set ORG_PROD_IMAGE to an "
-        "accessible image, or enable ORG_ALLOW_LOCAL_PROD_BUILD=true."
+        "accessible image (for example `ghcr.io/juliancoy/org-backend:sha-<commit>`), "
+        "or enable ORG_ALLOW_LOCAL_PROD_BUILD=true."
     )
 
 
