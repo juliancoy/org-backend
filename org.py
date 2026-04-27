@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Request, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import Response
+from fastapi.responses import Response, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import List, Optional, Dict, Any, Set, Annotated, Callable
@@ -23,9 +23,10 @@ import secrets
 import base64
 import smtplib
 import socket
+import time
 from email.message import EmailMessage
 from pathlib import Path
-from urllib.parse import quote, urlparse, urljoin
+from urllib.parse import quote, urlparse, urljoin, urlencode
 from domain.auth import extract_bearer_token
 from domain.economy import EconomicEngine as DomainEconomicEngine
 from domain.governance import is_transition_allowed
@@ -132,6 +133,7 @@ REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
 # JWT settings
 PIDP_JWKS_URL = os.environ.get("PIDP_JWKS_URL", "http://pidp:8000/.well-known/jwks.json")
 PIDP_BASE_URL = os.environ.get("PIDP_BASE_URL", "http://pidp:8000")
+PIDP_APP_SLUG = (os.environ.get("PIDP_APP_SLUG", "code-collective") or "code-collective").strip() or "code-collective"
 PIDP_JWT_ISSUER = os.environ.get("PIDP_JWT_ISSUER")
 PIDP_JWT_AUDIENCE = os.environ.get("PIDP_JWT_AUDIENCE")
 ORG_ALLOWED_PAT_SCOPES = {
@@ -245,6 +247,14 @@ ORG_MATRIX_AUTO_PROVISION_PUBLIC_ORG_ROOMS = os.environ.get(
     "ORG_MATRIX_AUTO_PROVISION_PUBLIC_ORG_ROOMS",
     "true",
 ).strip().lower() in {"1", "true", "yes", "on"}
+ORG_MATRIX_AUTO_PROVISION_PUBLIC_EVENT_ROOMS = os.environ.get(
+    "ORG_MATRIX_AUTO_PROVISION_PUBLIC_EVENT_ROOMS",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+ORG_CHAT_FEED_CACHE_TTL_SECONDS = max(
+    3,
+    int(os.environ.get("ORG_CHAT_FEED_CACHE_TTL_SECONDS", "15")),
+)
 
 # SpiceDB (authorization)
 SPICEDB_HTTP_URL = os.environ.get("SPICEDB_HTTP_URL", "http://spicedb:8443").rstrip("/")
@@ -313,6 +323,8 @@ STOCK_MARKET_CLOSE_HOUR = 17
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_ORG_CHAT_FEED_CACHE: dict[str, tuple[float, Any]] = {}
 
 # Database Base
 Base = declarative_base()
@@ -1100,6 +1112,25 @@ class UserContactPage(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
 
 
+class NetworkBot(Base):
+    """First-class automation bot registry for Org Portal."""
+    __tablename__ = "network_bots"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    full_name = Column(String(255))
+    pidp_user_id = Column(String(255), nullable=False, unique=True, index=True)
+    description = Column(Text)
+    tags = Column(JSONB)
+    active = Column(Boolean, nullable=False, default=True, index=True)
+    created_by_user_id = Column(String(255), index=True)
+    updated_by_user_id = Column(String(255), index=True)
+    last_token_issued_at = Column(DateTime(timezone=True))
+    last_token_scope = Column(String(64))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+
+
 class OrganizationClaimRequest(Base):
     """Contested claim requests for already-claimed organizations."""
     __tablename__ = "organization_claim_requests"
@@ -1605,6 +1636,7 @@ class EventAttendanceRecordResponse(BaseModel):
 class BusinessCardSubmissionResponse(BaseModel):
     id: uuid.UUID
     submitted_by_user_id: str
+    submitted_by_name: Optional[str] = None
     image_filename: Optional[str] = None
     image_content_type: str
     image_size_bytes: int
@@ -1649,6 +1681,7 @@ class OrgChatRoomDirectoryItemResponse(BaseModel):
     organization_name: str
     organization_slug: str
     relationship_status: str = Field(..., pattern="^(attendee|member|admin)$")
+    organization_member_count: int = 0
     room_id: str
     room_alias: Optional[str] = None
     room_name: Optional[str] = None
@@ -1738,6 +1771,54 @@ class PublicOrganizationAdminResponse(BaseModel):
     user_name: Optional[str] = None
     user_email: Optional[str] = None
     role: str = "admin"
+
+
+class PublicOrganizationChatResponse(BaseModel):
+    organization_slug: str
+    room_exists: bool = False
+    room_id: Optional[str] = None
+    room_alias: Optional[str] = None
+    room_name: Optional[str] = None
+
+
+class PublicOrganizationChatMessageResponse(BaseModel):
+    event_id: str
+    sender: Optional[str] = None
+    body: str
+    sent_at: Optional[datetime] = None
+
+
+class PublicOrganizationChatRoomFeedResponse(BaseModel):
+    key: str
+    label: str
+    room_id: Optional[str] = None
+    room_alias: Optional[str] = None
+    room_name: Optional[str] = None
+    messages: List[PublicOrganizationChatMessageResponse] = Field(default_factory=list)
+
+
+class PublicOrganizationChatFeedResponse(BaseModel):
+    organization_slug: str
+    rooms: List[PublicOrganizationChatRoomFeedResponse] = Field(default_factory=list)
+
+
+class PublicEventChatResponse(BaseModel):
+    event_slug: str
+    room_exists: bool = False
+    room_id: Optional[str] = None
+    room_alias: Optional[str] = None
+    room_name: Optional[str] = None
+    messages: List[PublicOrganizationChatMessageResponse] = Field(default_factory=list)
+
+
+class OrgChatRoomBackfillResponse(BaseModel):
+    organizations_total: int
+    organizations_scanned: int
+    public_rooms_found: int
+    public_rooms_created: int
+    announcements_rooms_found: int
+    announcements_rooms_created: int
+    errors: List[str] = Field(default_factory=list)
 
 
 class NetworkEventCreate(BaseModel):
@@ -2056,6 +2137,55 @@ class NetworkUserListItemResponse(BaseModel):
     contact_enabled: bool = False
     headline: Optional[str] = None
     photo_url: Optional[str] = None
+
+
+class NetworkBotResponse(BaseModel):
+    id: uuid.UUID
+    email: str
+    full_name: Optional[str] = None
+    pidp_user_id: str
+    description: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    active: bool
+    created_by_user_id: Optional[str] = None
+    updated_by_user_id: Optional[str] = None
+    last_token_issued_at: Optional[datetime] = None
+    last_token_scope: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NetworkBotProvisionRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
+    full_name: Optional[str] = Field(None, max_length=255)
+    password: str = Field(..., min_length=8, max_length=255)
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    issue_api_token: bool = True
+    api_token_name: str = Field("orgportal-bot", min_length=1, max_length=100)
+    api_token_scope: str = Field("org_admin", pattern="^(service|org_portal|org_mcp|org_admin)$")
+
+
+class NetworkBotProvisionResponse(BaseModel):
+    bot: NetworkBotResponse
+    issued_api_token: Optional[str] = None
+    issued_api_token_name: Optional[str] = None
+    issued_api_token_scope: Optional[str] = None
+
+
+class NetworkBotIssueTokenRequest(BaseModel):
+    password: str = Field(..., min_length=8, max_length=255)
+    api_token_name: str = Field("orgportal-bot", min_length=1, max_length=100)
+    api_token_scope: str = Field("org_admin", pattern="^(service|org_portal|org_mcp|org_admin)$")
+
+
+class NetworkBotIssueTokenResponse(BaseModel):
+    bot: NetworkBotResponse
+    issued_api_token: str
+    issued_api_token_name: str
+    issued_api_token_scope: str
 
 
 class ContactImportPayload(BaseModel):
@@ -2735,6 +2865,93 @@ async def _fetch_pidp_identity(token: str) -> dict[str, Any]:
         }
 
 
+def _extract_pidp_avatar_url(user_row: dict[str, Any]) -> str | None:
+    if not isinstance(user_row, dict):
+        return None
+    identity_data = user_row.get("identity_data")
+    if not isinstance(identity_data, dict):
+        identity_data = {}
+    candidates = [
+        user_row.get("avatar_url"),
+        identity_data.get("avatar_url"),
+        user_row.get("picture"),
+        user_row.get("photo_url"),
+    ]
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return None
+
+
+async def _fetch_pidp_avatar_map_by_email(token: str, emails: set[str]) -> dict[str, str]:
+    target_emails = {str(email or "").strip().lower() for email in emails if str(email or "").strip()}
+    if not target_emails:
+        return {}
+
+    resolved: dict[str, str] = {}
+    timeout = httpx.Timeout(connect=10.0, read=12.0, write=10.0, pool=10.0)
+    headers = {"Authorization": f"Bearer {token}"}
+    limit = max(100, min(len(target_emails), 500))
+    offset = 0
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for _ in range(20):
+                resp = await client.get(
+                    f"{PIDP_BASE_URL}/auth/users",
+                    params={"limit": limit, "offset": offset},
+                    headers=headers,
+                )
+                if not resp.is_success:
+                    # This endpoint is often restricted to sysadmin tokens.
+                    return resolved
+
+                payload = resp.json()
+                rows: list[dict[str, Any]]
+                total: int | None = None
+                if isinstance(payload, list):
+                    rows = [row for row in payload if isinstance(row, dict)]
+                elif isinstance(payload, dict):
+                    raw_rows = payload.get("users")
+                    if not isinstance(raw_rows, list):
+                        raw_rows = payload.get("items")
+                    if not isinstance(raw_rows, list):
+                        raw_rows = payload.get("results")
+                    rows = [row for row in (raw_rows or []) if isinstance(row, dict)]
+                    try:
+                        total = int(payload.get("total")) if payload.get("total") is not None else None
+                    except Exception:
+                        total = None
+                else:
+                    rows = []
+
+                if not rows:
+                    break
+
+                for row in rows:
+                    email = str(row.get("email") or "").strip().lower()
+                    if not email or email not in target_emails or email in resolved:
+                        continue
+                    avatar_url = _extract_pidp_avatar_url(row)
+                    if avatar_url:
+                        resolved[email] = avatar_url
+
+                if len(resolved) >= len(target_emails):
+                    break
+
+                page_count = len(rows)
+                if page_count < limit:
+                    break
+                offset += page_count
+                if total is not None and offset >= total:
+                    break
+    except Exception as exc:
+        logger.warning(f"Unable to load PIdP avatars for network users: {exc}")
+
+    return resolved
+
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     session: Session = Depends(get_db)
@@ -2787,6 +3004,27 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
+@app.get("/auth/social/{provider}/login")
+async def redirect_social_login(
+    provider: str,
+    request: Request,
+    next: Optional[str] = None,
+):
+    normalized_provider = (provider or "").strip().lower()
+    if normalized_provider not in {"google", "github"}:
+        raise HTTPException(status_code=404, detail="Unsupported social provider")
+
+    next_target = (next or "").strip()
+    if not next_target:
+        next_target = str(request.headers.get("referer") or "").strip() or "/"
+
+    query = {"app": PIDP_APP_SLUG}
+    if next_target:
+        query["next"] = next_target
+    pidp_login_url = f"{PIDP_BASE_URL}/auth/{normalized_provider}/login?{urlencode(query)}"
+    return RedirectResponse(url=pidp_login_url, status_code=307)
+
+
 def _require_authenticated_user(current_user: dict) -> None:
     if current_user.get("is_anonymous"):
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -2794,6 +3032,66 @@ def _require_authenticated_user(current_user: dict) -> None:
 
 def _actor_user_id(current_user: dict) -> str:
     return str(current_user.get("pidp_id") or current_user.get("id") or "")
+
+
+def _token_grants(current_user: dict) -> set[str]:
+    grants = current_user.get("token_scope_grants") or []
+    normalized: set[str] = set()
+    for grant in grants:
+        value = str(grant or "").strip()
+        if value:
+            normalized.add(value)
+    return normalized
+
+
+def _has_required_pat_grant(current_user: dict, required_grants: list[str]) -> bool:
+    if not required_grants:
+        return True
+    token_kind = str(current_user.get("token_kind") or "").strip().lower()
+    if token_kind != "pat":
+        return True
+
+    grants = _token_grants(current_user)
+    if "*" in grants:
+        return True
+
+    def _grant_allows(token_grant: str, required_grant: str) -> bool:
+        if token_grant == "*":
+            return True
+        if token_grant.endswith("*"):
+            return required_grant.startswith(token_grant[:-1])
+        return token_grant == required_grant
+
+    for required in required_grants:
+        required_value = str(required or "").strip()
+        if not required_value:
+            continue
+        if any(_grant_allows(token_grant, required_value) for token_grant in grants):
+            return True
+    return False
+
+
+def _require_sysadmin(
+    current_user: dict,
+    *,
+    pat_required_grants: Optional[list[str]] = None,
+    detail: str = "SysAdmin privileges required",
+) -> None:
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail=detail)
+    if pat_required_grants and not _has_required_pat_grant(current_user, pat_required_grants):
+        raise HTTPException(
+            status_code=403,
+            detail=f"PAT missing required grant. Need one of: {', '.join(pat_required_grants)}",
+        )
+
+
+def _can_use_sysadmin_override(current_user: dict, required_grants: Optional[list[str]] = None) -> bool:
+    if not _is_sysadmin(current_user):
+        return False
+    if required_grants and not _has_required_pat_grant(current_user, required_grants):
+        return False
+    return True
 
 
 def _normalize_business_card_text(value: str) -> str:
@@ -3849,6 +4147,8 @@ def _matrix_org_room_alias_candidates(org_slug: str) -> list[str]:
     normalized_slug = _slugify(org_slug)
     # Keep alias derivation deterministic and backward-compatible with likely variants.
     localparts = [
+        f"org-{normalized_slug}-public",
+        f"org-{normalized_slug}-public-chat",
         f"org-{normalized_slug}",
         normalized_slug,
         f"org-{normalized_slug}-chat",
@@ -3866,7 +4166,7 @@ def _matrix_org_room_alias_candidates(org_slug: str) -> list[str]:
 
 def _matrix_org_room_alias_localpart(org_slug: str) -> str:
     normalized_slug = _slugify(org_slug)
-    return f"org-{normalized_slug}"
+    return f"org-{normalized_slug}-public"
 
 
 async def _matrix_room_id_from_alias(
@@ -3895,6 +4195,60 @@ async def _resolve_org_public_chat_room(
     return None, None
 
 
+def _matrix_retry_after_seconds(response: httpx.Response) -> float:
+    retry_after_ms = 1000
+    try:
+        body = response.json() if response.content else {}
+        retry_after_ms = int((body or {}).get("retry_after_ms") or retry_after_ms)
+    except Exception:
+        retry_after_ms = 1000
+    return max(0.25, min(retry_after_ms / 1000.0, 60.0))
+
+
+async def _matrix_create_room_with_retry(
+    client: httpx.AsyncClient,
+    payload: dict[str, Any],
+    max_attempts: int = 4,
+) -> httpx.Response:
+    response: Optional[httpx.Response] = None
+    for attempt in range(max_attempts):
+        response = await client.post(
+            f"{ORG_MATRIX_HOMESERVER_URL}/_matrix/client/v3/createRoom",
+            headers=_matrix_admin_headers(),
+            json=payload,
+        )
+        if response.status_code != 429:
+            return response
+        if attempt >= max_attempts - 1:
+            return response
+        await asyncio.sleep(_matrix_retry_after_seconds(response))
+    if response is None:
+        raise RuntimeError("Matrix create room request did not execute")
+    return response
+
+
+def _matrix_http_error_detail(response: httpx.Response, fallback: str) -> str:
+    try:
+        payload = response.json() if response.content else {}
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict):
+        errcode = str(payload.get("errcode") or "").strip().upper()
+        retry_after_ms = int(payload.get("retry_after_ms") or 0) if payload.get("retry_after_ms") else 0
+        if errcode == "M_LIMIT_EXCEEDED":
+            if retry_after_ms > 0:
+                wait_seconds = max(1, int((retry_after_ms + 999) // 1000))
+                return f"Matrix is rate-limiting requests. Please retry in about {wait_seconds}s."
+            return "Matrix is rate-limiting requests. Please retry shortly."
+        message = str(payload.get("error") or payload.get("detail") or "").strip()
+        if message:
+            return message
+    text = (response.text or "").strip()
+    if text:
+        return text[:300]
+    return fallback
+
+
 async def _matrix_create_public_org_room(
     client: httpx.AsyncClient,
     org_name: str,
@@ -3909,11 +4263,7 @@ async def _matrix_create_public_org_room(
         "topic": f"Public discussion space for {org_name or org_slug}",
         "room_alias_name": alias_localpart,
     }
-    response = await client.post(
-        f"{ORG_MATRIX_HOMESERVER_URL}/_matrix/client/v3/createRoom",
-        headers=_matrix_admin_headers(),
-        json=payload,
-    )
+    response = await _matrix_create_room_with_retry(client, payload)
     if response.is_success:
         body = response.json() if response.content else {}
         room_id = str(body.get("room_id") or "").strip()
@@ -3981,6 +4331,472 @@ async def _matrix_find_public_room_for_org(
     return None, None, None
 
 
+def _matrix_org_general_alias_candidates(org_slug: str) -> list[str]:
+    normalized_slug = _slugify(org_slug)
+    localparts = [
+        f"org-{normalized_slug}-public",
+        f"org-{normalized_slug}-public-chat",
+        f"org-{normalized_slug}",
+        f"org-{normalized_slug}-general",
+        f"org-{normalized_slug}-chat",
+        f"{normalized_slug}-public",
+        f"{normalized_slug}-public-chat",
+        normalized_slug,
+        f"{normalized_slug}-general",
+    ]
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for localpart in localparts:
+        alias = f"#{localpart}:{ORG_MATRIX_SERVER_NAME}"
+        if alias in seen:
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return aliases
+
+
+def _matrix_org_announcements_alias_candidates(org_slug: str) -> list[str]:
+    normalized_slug = _slugify(org_slug)
+    localparts = [
+        f"org-{normalized_slug}-announcements",
+        f"org-{normalized_slug}-announcement",
+        f"{normalized_slug}-announcements",
+        f"{normalized_slug}-announcement",
+    ]
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for localpart in localparts:
+        alias = f"#{localpart}:{ORG_MATRIX_SERVER_NAME}"
+        if alias in seen:
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return aliases
+
+
+def _matrix_org_announcements_alias_localpart(org_slug: str) -> str:
+    normalized_slug = _slugify(org_slug)
+    return f"org-{normalized_slug}-announcements"
+
+
+def _matrix_event_room_alias_candidates(event_slug: str) -> list[str]:
+    normalized_slug = _slugify(event_slug)
+    localparts = [
+        f"event-{normalized_slug}-chat",
+        f"event-{normalized_slug}",
+        f"{normalized_slug}-chat",
+    ]
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for localpart in localparts:
+        alias = f"#{localpart}:{ORG_MATRIX_SERVER_NAME}"
+        if alias in seen:
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return aliases
+
+
+def _matrix_event_room_alias_localpart(event_slug: str) -> str:
+    normalized_slug = _slugify(event_slug)
+    return f"event-{normalized_slug}-chat"
+
+
+async def _matrix_create_public_event_room(
+    client: httpx.AsyncClient,
+    event_title: str,
+    event_slug: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    alias_localpart = _matrix_event_room_alias_localpart(event_slug)
+    primary_alias = f"#{alias_localpart}:{ORG_MATRIX_SERVER_NAME}"
+    display_name = (event_title or event_slug).strip()[:220] or event_slug
+    payload = {
+        "visibility": "public",
+        "preset": "public_chat",
+        "name": f"{display_name} • Event Chat",
+        "topic": f"Public event discussion room for {display_name}",
+        "room_alias_name": alias_localpart,
+    }
+    response = await _matrix_create_room_with_retry(client, payload)
+    if response.is_success:
+        body = response.json() if response.content else {}
+        room_id = str(body.get("room_id") or "").strip()
+        if room_id:
+            logger.info("Provisioned Matrix event room slug=%s room_id=%s", event_slug, room_id)
+            return room_id, primary_alias, payload["name"]
+        return None, None, None
+
+    error_text = (response.text or "").strip().lower()
+    if response.status_code in {400, 409} and (
+        "room alias" in error_text or "in use" in error_text or "m_room_in_use" in error_text
+    ):
+        existing_room_id = await _matrix_room_id_from_alias(client, primary_alias)
+        if existing_room_id:
+            logger.info("Reused existing Matrix event room slug=%s room_id=%s", event_slug, existing_room_id)
+            return existing_room_id, primary_alias, payload["name"]
+    logger.warning(
+        "Failed to provision Matrix event room slug=%s status=%s body=%s",
+        event_slug,
+        response.status_code,
+        (response.text or "").strip()[:400],
+    )
+    return None, None, None
+
+
+async def _matrix_find_public_room_for_event(
+    client: httpx.AsyncClient,
+    event_title: str,
+    event_slug: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    slug = _slugify(event_slug)
+    title = (event_title or "").strip().lower()
+    search_terms = [slug, title]
+    for term in search_terms:
+        if not term:
+            continue
+        response = await client.post(
+            f"{ORG_MATRIX_HOMESERVER_URL}/_matrix/client/v3/publicRooms",
+            json={
+                "limit": 70,
+                "filter": {"generic_search_term": term},
+            },
+        )
+        if not response.is_success:
+            continue
+        payload = response.json() if response.content else {}
+        chunk = payload.get("chunk") if isinstance(payload, dict) else None
+        if not isinstance(chunk, list):
+            continue
+        for room in chunk:
+            if not isinstance(room, dict):
+                continue
+            room_id = str(room.get("room_id") or "").strip()
+            canonical_alias = str(room.get("canonical_alias") or "").strip() or None
+            room_name = str(room.get("name") or "").strip() or None
+            if not room_id:
+                continue
+            alias_text = (canonical_alias or "").lower()
+            room_name_text = (room_name or "").lower()
+            if slug and (slug in alias_text or slug in room_name_text):
+                return room_id, canonical_alias, room_name
+            if title and title in room_name_text:
+                return room_id, canonical_alias, room_name
+    return None, None, None
+
+
+async def _matrix_ensure_event_chat_room(
+    client: httpx.AsyncClient,
+    event_title: str,
+    event_slug: str,
+    *,
+    allow_create: bool,
+) -> dict[str, Any]:
+    room_id: Optional[str] = None
+    room_alias: Optional[str] = None
+    room_name: Optional[str] = f"{(event_title or event_slug).strip()[:220] or event_slug} • Event Chat"
+    created = False
+
+    for alias in _matrix_event_room_alias_candidates(event_slug):
+        room_id = await _matrix_room_id_from_alias(client, alias)
+        if room_id:
+            room_alias = alias
+            break
+    if not room_id:
+        discovered_room_id, discovered_alias, discovered_name = await _matrix_find_public_room_for_event(
+            client=client,
+            event_title=event_title,
+            event_slug=event_slug,
+        )
+        if discovered_room_id:
+            room_id = discovered_room_id
+            room_alias = discovered_alias
+            room_name = discovered_name or room_name
+    if not room_id and allow_create:
+        created_room_id, created_alias, created_name = await _matrix_create_public_event_room(
+            client=client,
+            event_title=event_title,
+            event_slug=event_slug,
+        )
+        if created_room_id:
+            room_id = created_room_id
+            room_alias = created_alias
+            room_name = created_name
+            created = True
+    return {
+        "room_id": room_id,
+        "room_alias": room_alias,
+        "room_name": room_name,
+        "created": created,
+    }
+
+
+async def _matrix_create_org_announcements_room(
+    client: httpx.AsyncClient,
+    org_name: str,
+    org_slug: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    alias_localpart = _matrix_org_announcements_alias_localpart(org_slug)
+    primary_alias = f"#{alias_localpart}:{ORG_MATRIX_SERVER_NAME}"
+    display_name = (org_name or org_slug).strip()[:220] or org_slug
+    payload = {
+        "visibility": "public",
+        "preset": "public_chat",
+        "name": f"{display_name} Announcements",
+        "topic": f"Official announcements for {display_name}",
+        "room_alias_name": alias_localpart,
+    }
+    response = await _matrix_create_room_with_retry(client, payload)
+    if response.is_success:
+        body = response.json() if response.content else {}
+        room_id = str(body.get("room_id") or "").strip()
+        if room_id:
+            logger.info("Provisioned Matrix announcements room slug=%s room_id=%s", org_slug, room_id)
+            return room_id, primary_alias, payload["name"]
+        return None, None, None
+
+    error_text = (response.text or "").strip().lower()
+    if response.status_code in {400, 409} and (
+        "room alias" in error_text or "in use" in error_text or "m_room_in_use" in error_text
+    ):
+        existing_room_id = await _matrix_room_id_from_alias(client, primary_alias)
+        if existing_room_id:
+            logger.info("Reused existing Matrix announcements room slug=%s room_id=%s", org_slug, existing_room_id)
+            return existing_room_id, primary_alias, payload["name"]
+    logger.warning(
+        "Failed to provision Matrix announcements room slug=%s status=%s body=%s",
+        org_slug,
+        response.status_code,
+        (response.text or "").strip()[:400],
+    )
+    return None, None, None
+
+
+async def _matrix_search_public_rooms_for_org(
+    client: httpx.AsyncClient,
+    org_name: str,
+    org_slug: str,
+) -> list[dict[str, Any]]:
+    search_terms = [(_slugify(org_slug) or "").strip(), (org_name or "").strip().lower()]
+    rooms_by_id: dict[str, dict[str, Any]] = {}
+    for term in search_terms:
+        if not term:
+            continue
+        resp = await client.post(
+            f"{ORG_MATRIX_HOMESERVER_URL}/_matrix/client/v3/publicRooms",
+            json={"limit": 100, "filter": {"generic_search_term": term}},
+        )
+        if not resp.is_success:
+            continue
+        payload = resp.json() if resp.content else {}
+        chunk = payload.get("chunk") if isinstance(payload, dict) else None
+        if not isinstance(chunk, list):
+            continue
+        for row in chunk:
+            if not isinstance(row, dict):
+                continue
+            room_id = str(row.get("room_id") or "").strip()
+            if not room_id or room_id in rooms_by_id:
+                continue
+            rooms_by_id[room_id] = row
+    return list(rooms_by_id.values())
+
+
+def _matrix_pick_org_room_from_public_results(
+    rooms: list[dict[str, Any]],
+    org_slug: str,
+    org_name: str,
+    key: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    slug = _slugify(org_slug)
+    name = (org_name or "").strip().lower()
+    desired = "announc" if key == "announcements" else "public"
+    best_match: tuple[int, str, Optional[str], Optional[str]] | None = None
+    for row in rooms:
+        room_id = str(row.get("room_id") or "").strip()
+        if not room_id:
+            continue
+        alias = str(row.get("canonical_alias") or "").strip() or None
+        room_name = str(row.get("name") or "").strip() or None
+        topic = str(row.get("topic") or "").strip() or None
+        haystack = " ".join(
+            [
+                (alias or "").lower(),
+                (room_name or "").lower(),
+                (topic or "").lower(),
+            ]
+        )
+        if slug and slug not in haystack and not (name and name in haystack):
+            continue
+        score = 0
+        if desired in haystack:
+            score += 10
+        if key in {"general", "public_chat"} and "chat" in haystack:
+            score += 3
+        if alias and alias.startswith(f"#org-{slug}"):
+            score += 3
+        if room_name and name and name in room_name.lower():
+            score += 2
+        if best_match is None or score > best_match[0]:
+            best_match = (score, room_id, alias, room_name)
+    if best_match is None:
+        return None, None, None
+    return best_match[1], best_match[2], best_match[3]
+
+
+async def _matrix_join_room_as_admin(client: httpx.AsyncClient, room_ref: str) -> bool:
+    encoded = quote(room_ref, safe="")
+    resp = await client.post(
+        f"{ORG_MATRIX_HOMESERVER_URL}/_matrix/client/v3/join/{encoded}",
+        headers=_matrix_admin_headers(),
+        json={},
+    )
+    if resp.is_success:
+        return True
+    if resp.status_code in {403, 404, 429}:
+        return False
+    # Already joined and some Synapse versions can return 400-ish states.
+    body = (resp.text or "").lower()
+    if "already in the room" in body:
+        return True
+    return False
+
+
+async def _matrix_recent_room_messages(
+    client: httpx.AsyncClient,
+    room_id: str,
+    limit: int = 20,
+) -> list[PublicOrganizationChatMessageResponse]:
+    encoded_room_id = quote(room_id, safe="")
+    joined = await _matrix_join_room_as_admin(client, room_id)
+    if not joined:
+        return []
+    resp = await client.get(
+        f"{ORG_MATRIX_HOMESERVER_URL}/_matrix/client/v3/rooms/{encoded_room_id}/messages",
+        headers=_matrix_admin_headers(),
+        params={"dir": "b", "limit": max(1, min(limit, 50))},
+    )
+    if not resp.is_success:
+        return []
+    payload = resp.json() if resp.content else {}
+    chunk = payload.get("chunk") if isinstance(payload, dict) else None
+    if not isinstance(chunk, list):
+        return []
+    messages: list[PublicOrganizationChatMessageResponse] = []
+    for event in chunk:
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("type") or "") != "m.room.message":
+            continue
+        content = event.get("content")
+        if not isinstance(content, dict):
+            continue
+        msgtype = str(content.get("msgtype") or "")
+        if msgtype not in {"m.text", "m.notice"}:
+            continue
+        body = str(content.get("body") or "").strip()
+        if not body:
+            continue
+        origin_ts = event.get("origin_server_ts")
+        sent_at: Optional[datetime] = None
+        try:
+            if origin_ts is not None:
+                sent_at = datetime.fromtimestamp(float(origin_ts) / 1000.0, tz=timezone.utc)
+        except Exception:
+            sent_at = None
+        messages.append(
+            PublicOrganizationChatMessageResponse(
+                event_id=str(event.get("event_id") or ""),
+                sender=str(event.get("sender") or "").strip() or None,
+                body=body,
+                sent_at=sent_at,
+            )
+        )
+    messages.reverse()
+    return messages
+
+
+async def _matrix_ensure_org_chat_rooms(
+    client: httpx.AsyncClient,
+    org_name: str,
+    org_slug: str,
+    *,
+    allow_create: bool,
+) -> dict[str, dict[str, Any]]:
+    public_room_id: Optional[str] = None
+    public_alias: Optional[str] = None
+    public_name: Optional[str] = org_name
+    announcements_room_id: Optional[str] = None
+    announcements_alias: Optional[str] = None
+    announcements_name: Optional[str] = "Announcements"
+    public_created = False
+    announcements_created = False
+
+    public_rooms = await _matrix_search_public_rooms_for_org(client, org_name, org_slug)
+
+    for alias in _matrix_org_general_alias_candidates(org_slug):
+        public_room_id = await _matrix_room_id_from_alias(client, alias)
+        if public_room_id:
+            public_alias = alias
+            break
+    if not public_room_id:
+        public_room_id, public_alias, public_name = _matrix_pick_org_room_from_public_results(
+            public_rooms,
+            org_slug=org_slug,
+            org_name=org_name,
+            key="public_chat",
+        )
+    if not public_room_id and allow_create:
+        created_id, created_alias, created_name = await _matrix_create_public_org_room(
+            client=client,
+            org_name=org_name,
+            org_slug=org_slug,
+        )
+        if created_id:
+            public_room_id = created_id
+            public_alias = created_alias
+            public_name = created_name
+            public_created = True
+
+    for alias in _matrix_org_announcements_alias_candidates(org_slug):
+        announcements_room_id = await _matrix_room_id_from_alias(client, alias)
+        if announcements_room_id:
+            announcements_alias = alias
+            break
+    if not announcements_room_id:
+        announcements_room_id, announcements_alias, announcements_name = _matrix_pick_org_room_from_public_results(
+            public_rooms,
+            org_slug=org_slug,
+            org_name=org_name,
+            key="announcements",
+        )
+    if not announcements_room_id and allow_create:
+        created_id, created_alias, created_name = await _matrix_create_org_announcements_room(
+            client=client,
+            org_name=org_name,
+            org_slug=org_slug,
+        )
+        if created_id:
+            announcements_room_id = created_id
+            announcements_alias = created_alias
+            announcements_name = created_name
+            announcements_created = True
+
+    return {
+        "public_chat": {
+            "room_id": public_room_id,
+            "room_alias": public_alias,
+            "room_name": public_name or org_name,
+            "created": public_created,
+        },
+        "announcements": {
+            "room_id": announcements_room_id,
+            "room_alias": announcements_alias,
+            "room_name": announcements_name or "Announcements",
+            "created": announcements_created,
+        },
+    }
+
+
 async def _matrix_upsert_user(
     client: httpx.AsyncClient,
     matrix_user_id: str,
@@ -4000,8 +4816,10 @@ async def _matrix_upsert_user(
         },
     )
     if not resp.is_success:
-        detail = resp.text.strip() or f"Matrix admin user upsert failed ({resp.status_code})"
-        raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(
+            status_code=502,
+            detail=_matrix_http_error_detail(resp, f"Matrix admin user upsert failed ({resp.status_code})"),
+        )
 
 
 async def _matrix_login_password(
@@ -4021,8 +4839,10 @@ async def _matrix_login_password(
         },
     )
     if not login_resp.is_success:
-        detail = login_resp.text.strip() or f"Matrix login failed ({login_resp.status_code})"
-        raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(
+            status_code=502,
+            detail=_matrix_http_error_detail(login_resp, f"Matrix login failed ({login_resp.status_code})"),
+        )
     payload = login_resp.json()
     access_token = str(payload.get("access_token") or "").strip()
     user_id = str(payload.get("user_id") or "").strip()
@@ -4148,6 +4968,38 @@ def _map_org(org: Organization, current_user_id: Optional[str] = None) -> Organi
         my_role=my_role,
         created_at=org.created_at,
         updated_at=org.updated_at,
+    )
+
+
+def _normalize_bot_tags(values: Optional[List[str]]) -> List[str]:
+    if not values:
+        return []
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        item = str(raw or "").strip().lower()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _map_network_bot(bot: NetworkBot) -> NetworkBotResponse:
+    return NetworkBotResponse(
+        id=bot.id,
+        email=bot.email,
+        full_name=bot.full_name,
+        pidp_user_id=bot.pidp_user_id,
+        description=bot.description,
+        tags=list(bot.tags or []),
+        active=bool(bot.active),
+        created_by_user_id=bot.created_by_user_id,
+        updated_by_user_id=bot.updated_by_user_id,
+        last_token_issued_at=bot.last_token_issued_at,
+        last_token_scope=bot.last_token_scope,
+        created_at=bot.created_at,
+        updated_at=bot.updated_at,
     )
 
 
@@ -5760,8 +6612,7 @@ async def seed_organizations(
     session: Session = Depends(get_db),
 ):
     _require_authenticated_user(current_user)
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
+    _require_sysadmin(current_user, pat_required_grants=["org:admin.write", "org:*"])
     return _seed_organizations_from_event_sources(session, force_update=force_update)
 
 
@@ -5823,8 +6674,7 @@ async def create_team(
     session: Session = Depends(get_db),
 ):
     _require_authenticated_user(current_user)
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
+    _require_sysadmin(current_user, pat_required_grants=["org:admin.write", "org:*"])
     team = Team(
         id=uuid.uuid4(),
         name=payload.name.strip(),
@@ -5847,8 +6697,7 @@ async def upsert_team_membership(
     session: Session = Depends(get_db),
 ):
     _require_authenticated_user(current_user)
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
+    _require_sysadmin(current_user, pat_required_grants=["org:admin.write", "org:*"])
     team = session.query(Team).filter(Team.id == team_id).first()
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
@@ -5981,8 +6830,30 @@ async def get_public_organization(
         if target_slug:
             redirected_org = session.query(Organization).filter(Organization.slug == target_slug).first()
             if redirected_org:
+                try:
+                    timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        await _matrix_ensure_org_chat_rooms(
+                            client=client,
+                            org_name=redirected_org.name,
+                            org_slug=redirected_org.slug,
+                            allow_create=True,
+                        )
+                except Exception as exc:
+                    logger.warning("Matrix room ensure skipped for org_slug=%s error=%s", redirected_org.slug, exc)
                 return _map_public_org(redirected_org, session, redirected_from_slug=normalized)
         raise HTTPException(status_code=404, detail="Organization not found")
+    try:
+        timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            await _matrix_ensure_org_chat_rooms(
+                client=client,
+                org_name=org.name,
+                org_slug=org.slug,
+                allow_create=True,
+            )
+    except Exception as exc:
+        logger.warning("Matrix room ensure skipped for org_slug=%s error=%s", org.slug, exc)
     return _map_public_org(org, session)
 
 
@@ -6022,6 +6893,105 @@ async def list_public_organization_admins(
         )
 
     return admins
+
+
+@app.get("/api/network/orgs/public/{slug}/chat", response_model=PublicOrganizationChatResponse)
+async def get_public_organization_chat(
+    slug: str,
+    session: Session = Depends(get_db),
+):
+    normalized = slug.strip().lower()
+    org = session.query(Organization).filter(Organization.slug == normalized).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    room_id: Optional[str] = None
+    room_alias: Optional[str] = None
+    room_name: Optional[str] = None
+    timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            room_id, room_alias = await _resolve_org_public_chat_room(client, org.slug)
+            room_name = org.name
+            if not room_id:
+                discovered_room_id, discovered_alias, discovered_name = await _matrix_find_public_room_for_org(
+                    client,
+                    slug=org.slug,
+                    name=org.name,
+                    limit=120,
+                )
+                if discovered_room_id:
+                    room_id = discovered_room_id
+                    room_alias = discovered_alias
+                    room_name = discovered_name or org.name
+    except Exception as exc:
+        logger.warning("Unable to resolve public org chat slug=%s error=%s", org.slug, exc)
+
+    return PublicOrganizationChatResponse(
+        organization_slug=org.slug,
+        room_exists=bool(room_id),
+        room_id=room_id,
+        room_alias=room_alias,
+        room_name=room_name,
+    )
+
+
+@app.get("/api/network/orgs/public/{slug}/chat-feed", response_model=PublicOrganizationChatFeedResponse)
+async def get_public_organization_chat_feed(
+    slug: str,
+    session: Session = Depends(get_db),
+):
+    normalized = slug.strip().lower()
+    org = session.query(Organization).filter(Organization.slug == normalized).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    cache_key = org.slug
+    now_ts = time.time()
+    cached = _ORG_CHAT_FEED_CACHE.get(cache_key)
+    if cached and cached[0] > now_ts:
+        cached_payload = cached[1]
+        if isinstance(cached_payload, PublicOrganizationChatFeedResponse):
+            return cached_payload
+
+    timeout = httpx.Timeout(connect=8.0, read=10.0, write=10.0, pool=8.0)
+    rooms: list[PublicOrganizationChatRoomFeedResponse] = [
+        PublicOrganizationChatRoomFeedResponse(key="public_chat", label="Public Chat"),
+        PublicOrganizationChatRoomFeedResponse(key="announcements", label="Announcements"),
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            ensured = await _matrix_ensure_org_chat_rooms(
+                client=client,
+                org_name=org.name,
+                org_slug=org.slug,
+                # Public organization fetch already attempts creation; keep feed fast.
+                allow_create=False,
+            )
+
+            public_room = ensured.get("public_chat") or {}
+            public_room_id = str(public_room.get("room_id") or "").strip() or None
+            rooms[0].room_id = public_room_id
+            rooms[0].room_alias = str(public_room.get("room_alias") or "").strip() or None
+            rooms[0].room_name = str(public_room.get("room_name") or "").strip() or org.name
+            if public_room_id:
+                rooms[0].messages = await _matrix_recent_room_messages(client, public_room_id, limit=15)
+
+            announcements_room = ensured.get("announcements") or {}
+            announcements_room_id = str(announcements_room.get("room_id") or "").strip() or None
+            rooms[1].room_id = announcements_room_id
+            rooms[1].room_alias = str(announcements_room.get("room_alias") or "").strip() or None
+            rooms[1].room_name = str(announcements_room.get("room_name") or "").strip() or "Announcements"
+            if announcements_room_id:
+                rooms[1].messages = await _matrix_recent_room_messages(client, announcements_room_id, limit=15)
+    except Exception as exc:
+        logger.warning("Unable to resolve public org chat feed slug=%s error=%s", org.slug, exc)
+    response_payload = PublicOrganizationChatFeedResponse(
+        organization_slug=org.slug,
+        rooms=rooms,
+    )
+    _ORG_CHAT_FEED_CACHE[cache_key] = (now_ts + ORG_CHAT_FEED_CACHE_TTL_SECONDS, response_payload)
+    return response_payload
 
 
 @app.post("/api/network/orgs/public/{slug}/claim", response_model=OrganizationResponse)
@@ -6129,6 +7099,17 @@ async def create_organization(
     )
     session.commit()
     session.refresh(org)
+    try:
+        timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            await _matrix_ensure_org_chat_rooms(
+                client=client,
+                org_name=org.name,
+                org_slug=org.slug,
+                allow_create=True,
+            )
+    except Exception as exc:
+        logger.warning("Matrix room ensure skipped after org create slug=%s error=%s", org.slug, exc)
     return _map_org(org, user_id)
 
 
@@ -6221,7 +7202,7 @@ async def unclaim_organization(
         raise HTTPException(status_code=404, detail="Organization not found")
     if org.claimed_by_user_id is None:
         return _map_org(org, user_id)
-    if not _is_sysadmin(current_user) and org.claimed_by_user_id != user_id:
+    if not _can_use_sysadmin_override(current_user, ["org:admin.write", "org:*"]) and org.claimed_by_user_id != user_id:
         raise HTTPException(status_code=403, detail="Only the claiming user or an admin can unclaim this organization")
 
     previous_owner = org.claimed_by_user_id
@@ -6482,7 +7463,60 @@ async def get_public_network_event_by_slug(
     event = session.query(NetworkEvent).filter(NetworkEvent.slug == slug.strip().lower()).first()
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
+    if ORG_MATRIX_AUTO_PROVISION_PUBLIC_EVENT_ROOMS:
+        timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                await _matrix_ensure_event_chat_room(
+                    client=client,
+                    event_title=event.title,
+                    event_slug=event.slug,
+                    allow_create=True,
+                )
+        except Exception as exc:
+            logger.warning("Matrix event room ensure skipped for event_slug=%s error=%s", event.slug, exc)
     return _map_network_event(event, None, session)
+
+
+@app.get("/api/network/events/public/{slug}/chat", response_model=PublicEventChatResponse)
+async def get_public_event_chat(
+    slug: str,
+    session: Session = Depends(get_db),
+):
+    normalized = slug.strip().lower()
+    event = session.query(NetworkEvent).filter(NetworkEvent.slug == normalized).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    room_id: Optional[str] = None
+    room_alias: Optional[str] = None
+    room_name: Optional[str] = None
+    messages: list[PublicOrganizationChatMessageResponse] = []
+    timeout = httpx.Timeout(connect=8.0, read=10.0, write=10.0, pool=8.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            ensured = await _matrix_ensure_event_chat_room(
+                client=client,
+                event_title=event.title,
+                event_slug=event.slug,
+                allow_create=ORG_MATRIX_AUTO_PROVISION_PUBLIC_EVENT_ROOMS,
+            )
+            room_id = str(ensured.get("room_id") or "").strip() or None
+            room_alias = str(ensured.get("room_alias") or "").strip() or None
+            room_name = str(ensured.get("room_name") or "").strip() or None
+            if room_id:
+                messages = await _matrix_recent_room_messages(client, room_id, limit=20)
+    except Exception as exc:
+        logger.warning("Unable to resolve event chat slug=%s error=%s", event.slug, exc)
+
+    return PublicEventChatResponse(
+        event_slug=event.slug,
+        room_exists=bool(room_id),
+        room_id=room_id,
+        room_alias=room_alias,
+        room_name=room_name,
+        messages=messages,
+    )
 
 
 @app.post("/api/network/events", response_model=NetworkEventResponse)
@@ -6548,6 +7582,18 @@ async def create_network_event(
     )
     session.commit()
     session.refresh(event)
+    if ORG_MATRIX_AUTO_PROVISION_PUBLIC_EVENT_ROOMS:
+        timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                await _matrix_ensure_event_chat_room(
+                    client=client,
+                    event_title=event.title,
+                    event_slug=event.slug,
+                    allow_create=True,
+                )
+        except Exception as exc:
+            logger.warning("Matrix event room ensure skipped after event create slug=%s error=%s", event.slug, exc)
     return _map_network_event(event, current_user, session)
 
 
@@ -6613,7 +7659,7 @@ async def unclaim_network_event(
         raise HTTPException(status_code=404, detail="Event not found")
     if event.claimed_by_user_id is None:
         return _map_network_event(event, current_user, session)
-    if not _is_sysadmin(current_user) and event.claimed_by_user_id != user_id:
+    if not _can_use_sysadmin_override(current_user, ["org:admin.write", "org:*"]) and event.claimed_by_user_id != user_id:
         raise HTTPException(status_code=403, detail="Only the claiming user or an admin can unclaim this event")
 
     previous_owner = event.claimed_by_user_id
@@ -6646,7 +7692,7 @@ async def record_event_attendance(
 
     actor_user_id = _actor_user_id(current_user)
     target_user_id = (user_id or "").strip() or actor_user_id
-    if target_user_id != actor_user_id and not _is_sysadmin(current_user):
+    if target_user_id != actor_user_id and not _can_use_sysadmin_override(current_user, ["org:admin.write", "org:*"]):
         raise HTTPException(status_code=403, detail="Only SysAdmin can record attendance for another user")
 
     attendance = (
@@ -6748,7 +7794,7 @@ async def submit_business_card(
         raise HTTPException(status_code=413, detail=f"Image exceeds {max_bytes} bytes")
 
     image_sha256 = hashlib.sha256(image_bytes).hexdigest()
-    if not _is_sysadmin(current_user):
+    if not _can_use_sysadmin_override(current_user, ["org:admin.write", "org:*"]):
         _enforce_business_card_duplicate_hash_guard(
             session,
             image_sha256=image_sha256,
@@ -7185,17 +8231,26 @@ async def list_my_business_card_submissions(
     session: Session = Depends(get_db),
     limit: int = 100,
     offset: int = 0,
+    scope: str = Query("mine", pattern="^(mine|public)$"),
 ):
     _require_authenticated_user(current_user)
     actor_user_id = _actor_user_id(current_user)
-    if not actor_user_id:
+    if not actor_user_id and scope == "mine":
         return []
     safe_limit = max(1, min(limit, 1000))
     safe_offset = max(0, min(offset, 100000))
+    query = session.query(BusinessCardSubmission)
+    if scope == "mine":
+        query = query.filter(BusinessCardSubmission.submitted_by_user_id == actor_user_id)
+    else:
+        # Shared "Completed Scans" feed excludes incomplete processing states.
+        processing_status_expr = func.coalesce(
+            BusinessCardSubmission.extracted_metadata["processing_status"].astext,
+            "processed",
+        )
+        query = query.filter(processing_status_expr.in_(["processed", "clarification_required"]))
     rows = (
-        session.query(BusinessCardSubmission)
-        .filter(BusinessCardSubmission.submitted_by_user_id == actor_user_id)
-        .order_by(BusinessCardSubmission.created_at.desc(), BusinessCardSubmission.id.desc())
+        query.order_by(BusinessCardSubmission.created_at.desc(), BusinessCardSubmission.id.desc())
         .offset(safe_offset)
         .limit(safe_limit)
         .all()
@@ -7219,7 +8274,12 @@ async def get_my_business_card_submission_image(
     )
     if not submission:
         raise HTTPException(status_code=404, detail="Business card submission not found")
-    if submission.submitted_by_user_id != actor_user_id and not _is_sysadmin(current_user):
+    can_view_shared_completed_scan = submission.processing_status in {"processed", "clarification_required"}
+    if (
+        submission.submitted_by_user_id != actor_user_id
+        and not _can_use_sysadmin_override(current_user, ["org:admin.read", "org:*"])
+        and not can_view_shared_completed_scan
+    ):
         raise HTTPException(status_code=403, detail="Not authorized to view this scan image")
     if not submission.image_storage_path:
         raise HTTPException(status_code=404, detail="Stored image not available")
@@ -7351,6 +8411,19 @@ async def list_org_chat_rooms_for_current_user(
         return []
 
     org_ids = list(status_by_org_id.keys())
+    membership_count_rows = (
+        session.query(
+            OrganizationMembership.organization_id.label("organization_id"),
+            func.count(OrganizationMembership.user_id).label("membership_count"),
+        )
+        .filter(OrganizationMembership.organization_id.in_(org_ids))
+        .group_by(OrganizationMembership.organization_id)
+        .all()
+    )
+    membership_count_by_org_id = {
+        organization_id: int(membership_count or 0)
+        for organization_id, membership_count in membership_count_rows
+    }
     organizations = (
         session.query(Organization.id, Organization.name, Organization.slug)
         .filter(Organization.id.in_(org_ids))
@@ -7362,36 +8435,25 @@ async def list_org_chat_rooms_for_current_user(
     async with httpx.AsyncClient(timeout=timeout) as client:
         for org in organizations:
             relationship_status = status_by_org_id.get(org.id, "attendee")
-            room_id, room_alias = await _resolve_org_public_chat_room(client, org.slug)
+            room_id: Optional[str] = None
+            room_alias: Optional[str] = None
             room_name: Optional[str] = org.name
-            if not room_id:
-                room_id, discovered_alias, discovered_name = await _matrix_find_public_room_for_org(
+            try:
+                ensured = await _matrix_ensure_org_chat_rooms(
                     client=client,
                     org_name=org.name,
                     org_slug=org.slug,
+                    allow_create=(
+                        ORG_MATRIX_AUTO_PROVISION_PUBLIC_ORG_ROOMS
+                        and relationship_status in {"member", "admin"}
+                    ),
                 )
-                if discovered_alias:
-                    room_alias = discovered_alias
-                if discovered_name:
-                    room_name = discovered_name
-            if (
-                not room_id
-                and ORG_MATRIX_AUTO_PROVISION_PUBLIC_ORG_ROOMS
-                and relationship_status in {"member", "admin"}
-            ):
-                try:
-                    provisioned_room_id, provisioned_alias, provisioned_name = await _matrix_create_public_org_room(
-                        client=client,
-                        org_name=org.name,
-                        org_slug=org.slug,
-                    )
-                    if provisioned_room_id:
-                        room_id = provisioned_room_id
-                        room_alias = provisioned_alias
-                        if provisioned_name:
-                            room_name = provisioned_name
-                except Exception as exc:
-                    logger.warning("Matrix room auto-provision skipped for org_slug=%s error=%s", org.slug, exc)
+                public_room = ensured.get("public_chat") or {}
+                room_id = str(public_room.get("room_id") or "").strip() or None
+                room_alias = str(public_room.get("room_alias") or "").strip() or None
+                room_name = str(public_room.get("room_name") or "").strip() or org.name
+            except Exception as exc:
+                logger.warning("Matrix room ensure skipped for org_slug=%s error=%s", org.slug, exc)
             if not room_id:
                 continue
             response_items.append(
@@ -7400,20 +8462,69 @@ async def list_org_chat_rooms_for_current_user(
                     organization_name=org.name,
                     organization_slug=org.slug,
                     relationship_status=relationship_status,
+                    organization_member_count=membership_count_by_org_id.get(org.id, 0),
                     room_id=room_id,
                     room_alias=room_alias,
                     room_name=room_name,
                 )
             )
 
-    status_priority = {"admin": 0, "member": 1, "attendee": 2}
     response_items.sort(
         key=lambda item: (
-            status_priority.get(item.relationship_status, 99),
+            -int(item.organization_member_count or 0),
             item.organization_name.lower(),
         )
     )
     return response_items
+
+
+@app.post("/api/network/chat/rooms/backfill", response_model=OrgChatRoomBackfillResponse)
+async def backfill_org_chat_rooms(
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    _require_sysadmin(current_user, pat_required_grants=["org:admin.write", "org:*"])
+    organizations = session.query(Organization.id, Organization.name, Organization.slug).order_by(Organization.slug.asc()).all()
+    result = OrgChatRoomBackfillResponse(
+        organizations_total=len(organizations),
+        organizations_scanned=0,
+        public_rooms_found=0,
+        public_rooms_created=0,
+        announcements_rooms_found=0,
+        announcements_rooms_created=0,
+        errors=[],
+    )
+    if not organizations:
+        return result
+
+    timeout = httpx.Timeout(connect=8.0, read=10.0, write=10.0, pool=8.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for org in organizations:
+            result.organizations_scanned += 1
+            try:
+                ensured = await _matrix_ensure_org_chat_rooms(
+                    client=client,
+                    org_name=org.name,
+                    org_slug=org.slug,
+                    allow_create=True,
+                )
+                public_room = ensured.get("public_chat") or {}
+                if str(public_room.get("room_id") or "").strip():
+                    if bool(public_room.get("created")):
+                        result.public_rooms_created += 1
+                    else:
+                        result.public_rooms_found += 1
+
+                announcements_room = ensured.get("announcements") or {}
+                if str(announcements_room.get("room_id") or "").strip():
+                    if bool(announcements_room.get("created")):
+                        result.announcements_rooms_created += 1
+                    else:
+                        result.announcements_rooms_found += 1
+            except Exception as exc:
+                result.errors.append(f"{org.slug}: {exc}")
+    return result
 
 
 @app.get("/api/network/chat/link-preview", response_model=ChatLinkPreviewResponse)
@@ -7656,8 +8767,7 @@ async def list_claim_requests_queue(
     limit: int = 200,
 ):
     _require_authenticated_user(current_user)
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
+    _require_sysadmin(current_user, pat_required_grants=["org:admin.read", "org:*"])
 
     normalized_status = (status_filter or "pending").strip().lower()
     if normalized_status not in {"pending", "approved", "rejected", "all"}:
@@ -7801,8 +8911,7 @@ async def list_network_audit_events(
     target_type: Optional[str] = None,
 ):
     _require_authenticated_user(current_user)
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
+    _require_sysadmin(current_user, pat_required_grants=["org:admin.read", "org:*"])
     safe_limit = max(1, min(limit, 2000))
     query = session.query(NetworkAuditEvent)
     if event_type_prefix:
@@ -8197,6 +9306,7 @@ async def list_public_user_events(
 @app.get("/api/network/users", response_model=List[NetworkUserListItemResponse])
 async def list_network_users(
     current_user: dict = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
     session: Session = Depends(get_db),
     q: str = "",
     limit: int = 300,
@@ -8230,6 +9340,14 @@ async def list_network_users(
         else []
     )
     contact_by_user_id = {str(contact.user_id): contact for contact in contacts}
+    pidp_avatar_by_email: dict[str, str] = {}
+    missing_photo_emails = {
+        str(user.email or "").strip().lower()
+        for user in users
+        if user.email and not (contact_by_user_id.get(str(user.id)) and contact_by_user_id.get(str(user.id)).photo_url)
+    }
+    if credentials and missing_photo_emails:
+        pidp_avatar_by_email = await _fetch_pidp_avatar_map_by_email(credentials.credentials, missing_photo_emails)
 
     return [
         NetworkUserListItemResponse(
@@ -8240,10 +9358,268 @@ async def list_network_users(
             contact_slug=(contact_by_user_id.get(str(user.id)).slug if contact_by_user_id.get(str(user.id)) else None),
             contact_enabled=bool(contact_by_user_id.get(str(user.id)).enabled) if contact_by_user_id.get(str(user.id)) else False,
             headline=contact_by_user_id.get(str(user.id)).headline if contact_by_user_id.get(str(user.id)) else None,
-            photo_url=contact_by_user_id.get(str(user.id)).photo_url if contact_by_user_id.get(str(user.id)) else None,
+            photo_url=(
+                contact_by_user_id.get(str(user.id)).photo_url
+                if contact_by_user_id.get(str(user.id)) and contact_by_user_id.get(str(user.id)).photo_url
+                else pidp_avatar_by_email.get(str(user.email or "").strip().lower())
+            ),
         )
         for user in users
     ]
+
+
+@app.get("/api/network/bots", response_model=List[NetworkBotResponse])
+async def list_network_bots(
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+    q: str = "",
+    limit: int = 250,
+    offset: int = 0,
+    active_only: bool = True,
+):
+    _require_authenticated_user(current_user)
+    _require_sysadmin(
+        current_user,
+        pat_required_grants=["org:admin.read", "org:*"],
+        detail="SysAdmin access required",
+    )
+
+    safe_limit = max(1, min(limit, 1000))
+    safe_offset = max(0, min(offset, 100000))
+    query = session.query(NetworkBot)
+    if active_only:
+        query = query.filter(NetworkBot.active.is_(True))
+    if q.strip():
+        needle = f"%{q.strip()}%"
+        query = query.filter(
+            (NetworkBot.email.ilike(needle))
+            | (NetworkBot.full_name.ilike(needle))
+            | (NetworkBot.description.ilike(needle))
+        )
+
+    rows = (
+        query.order_by(NetworkBot.created_at.desc(), NetworkBot.email.asc())
+        .offset(safe_offset)
+        .limit(safe_limit)
+        .all()
+    )
+    return [_map_network_bot(row) for row in rows]
+
+
+@app.post("/api/network/bots/provision", response_model=NetworkBotProvisionResponse)
+async def provision_network_bot(
+    payload: NetworkBotProvisionRequest,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    _require_sysadmin(
+        current_user,
+        pat_required_grants=["org:admin.write", "org:*"],
+        detail="SysAdmin access required",
+    )
+
+    email = payload.email.strip().lower()
+    if not re.fullmatch(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}$", email):
+        raise HTTPException(status_code=422, detail="A valid bot email is required")
+
+    full_name = (payload.full_name or "").strip() or "Portal Bot"
+    timeout = httpx.Timeout(connect=12.0, read=12.0, write=12.0, pool=12.0)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        register_resp = await client.post(
+            f"{PIDP_BASE_URL}/auth/register",
+            json={
+                "email": email,
+                "password": payload.password,
+                "full_name": full_name,
+            },
+        )
+        if register_resp.status_code not in {200, 201, 409}:
+            detail = register_resp.text.strip() or f"PIdP register failed ({register_resp.status_code})"
+            raise HTTPException(status_code=register_resp.status_code, detail=detail)
+
+        login_resp = await client.post(
+            f"{PIDP_BASE_URL}/auth/token",
+            data={
+                "username": email,
+                "password": payload.password,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if not login_resp.is_success:
+            detail = login_resp.text.strip() or "Unable to authenticate bot user in PIdP"
+            raise HTTPException(status_code=400, detail=detail)
+        login_payload = login_resp.json()
+        bot_access_token = str(login_payload.get("access_token") or "").strip()
+        if not bot_access_token:
+            raise HTTPException(status_code=400, detail="Bot login succeeded without access token")
+
+        bot_identity_resp = await client.get(
+            f"{PIDP_BASE_URL}/auth/me",
+            headers={"Authorization": f"Bearer {bot_access_token}"},
+        )
+        if not bot_identity_resp.is_success:
+            detail = bot_identity_resp.text.strip() or "Unable to load bot identity from PIdP"
+            raise HTTPException(status_code=400, detail=detail)
+        bot_identity = bot_identity_resp.json()
+        pidp_user_id = str(bot_identity.get("id") or "").strip()
+        if not pidp_user_id:
+            raise HTTPException(status_code=400, detail="PIdP bot identity did not include a user id")
+
+        issued_api_token: Optional[str] = None
+        issued_api_token_name: Optional[str] = None
+        issued_api_token_scope: Optional[str] = None
+        if payload.issue_api_token:
+            token_issue_resp = await client.post(
+                f"{PIDP_BASE_URL}/auth/tokens",
+                headers={"Authorization": f"Bearer {bot_access_token}"},
+                json={
+                    "name": payload.api_token_name.strip(),
+                    "scope": payload.api_token_scope.strip(),
+                },
+            )
+            if not token_issue_resp.is_success:
+                detail = token_issue_resp.text.strip() or "Unable to issue bot API token"
+                raise HTTPException(status_code=400, detail=detail)
+            token_issue_payload = token_issue_resp.json()
+            issued_api_token = str(token_issue_payload.get("token") or "").strip() or None
+            issued_api_token_name = str(token_issue_payload.get("name") or "").strip() or payload.api_token_name.strip()
+            issued_api_token_scope = str(token_issue_payload.get("scope") or "").strip() or payload.api_token_scope.strip()
+
+    actor_user_id = _actor_user_id(current_user)
+    bot = (
+        session.query(NetworkBot)
+        .filter((NetworkBot.email == email) | (NetworkBot.pidp_user_id == pidp_user_id))
+        .first()
+    )
+    if not bot:
+        bot = NetworkBot(
+            id=uuid.uuid4(),
+            email=email,
+            pidp_user_id=pidp_user_id,
+            created_by_user_id=actor_user_id or None,
+        )
+        session.add(bot)
+
+    bot.email = email
+    bot.full_name = str(bot_identity.get("full_name") or full_name or email).strip()
+    bot.pidp_user_id = pidp_user_id
+    bot.description = payload.description
+    bot.tags = _normalize_bot_tags(payload.tags)
+    bot.active = True
+    bot.updated_by_user_id = actor_user_id or None
+    if issued_api_token_scope:
+        bot.last_token_scope = issued_api_token_scope
+        bot.last_token_issued_at = datetime.now(timezone.utc)
+
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="network.bot.provisioned",
+        target_type="network_bot",
+        target_id=str(bot.id),
+        metadata={
+            "email": bot.email,
+            "pidp_user_id": bot.pidp_user_id,
+            "issued_api_token": bool(issued_api_token),
+            "issued_api_token_name": issued_api_token_name,
+            "issued_api_token_scope": issued_api_token_scope,
+        },
+    )
+    session.commit()
+    session.refresh(bot)
+
+    return NetworkBotProvisionResponse(
+        bot=_map_network_bot(bot),
+        issued_api_token=issued_api_token,
+        issued_api_token_name=issued_api_token_name,
+        issued_api_token_scope=issued_api_token_scope,
+    )
+
+
+@app.post("/api/network/bots/{bot_id}/issue-token", response_model=NetworkBotIssueTokenResponse)
+async def issue_network_bot_token(
+    bot_id: uuid.UUID,
+    payload: NetworkBotIssueTokenRequest,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    _require_sysadmin(
+        current_user,
+        pat_required_grants=["org:admin.write", "org:*"],
+        detail="SysAdmin access required",
+    )
+
+    bot = session.query(NetworkBot).filter(NetworkBot.id == bot_id).first()
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+    if not bot.active:
+        raise HTTPException(status_code=400, detail="Bot is inactive")
+
+    timeout = httpx.Timeout(connect=12.0, read=12.0, write=12.0, pool=12.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        login_resp = await client.post(
+            f"{PIDP_BASE_URL}/auth/token",
+            data={
+                "username": bot.email,
+                "password": payload.password,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if not login_resp.is_success:
+            detail = login_resp.text.strip() or "Unable to authenticate bot user in PIdP"
+            raise HTTPException(status_code=400, detail=detail)
+        login_payload = login_resp.json()
+        bot_access_token = str(login_payload.get("access_token") or "").strip()
+        if not bot_access_token:
+            raise HTTPException(status_code=400, detail="Bot login succeeded without access token")
+
+        token_issue_resp = await client.post(
+            f"{PIDP_BASE_URL}/auth/tokens",
+            headers={"Authorization": f"Bearer {bot_access_token}"},
+            json={
+                "name": payload.api_token_name.strip(),
+                "scope": payload.api_token_scope.strip(),
+            },
+        )
+        if not token_issue_resp.is_success:
+            detail = token_issue_resp.text.strip() or "Unable to issue bot API token"
+            raise HTTPException(status_code=400, detail=detail)
+        token_issue_payload = token_issue_resp.json()
+
+    issued_api_token = str(token_issue_payload.get("token") or "").strip()
+    issued_api_token_name = str(token_issue_payload.get("name") or "").strip() or payload.api_token_name.strip()
+    issued_api_token_scope = str(token_issue_payload.get("scope") or "").strip() or payload.api_token_scope.strip()
+    if not issued_api_token:
+        raise HTTPException(status_code=400, detail="PIdP token issue response did not include token")
+
+    bot.updated_by_user_id = _actor_user_id(current_user) or None
+    bot.last_token_scope = issued_api_token_scope
+    bot.last_token_issued_at = datetime.now(timezone.utc)
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="network.bot.token_issued",
+        target_type="network_bot",
+        target_id=str(bot.id),
+        metadata={
+            "email": bot.email,
+            "pidp_user_id": bot.pidp_user_id,
+            "issued_api_token_name": issued_api_token_name,
+            "issued_api_token_scope": issued_api_token_scope,
+        },
+    )
+    session.commit()
+    session.refresh(bot)
+
+    return NetworkBotIssueTokenResponse(
+        bot=_map_network_bot(bot),
+        issued_api_token=issued_api_token,
+        issued_api_token_name=issued_api_token_name,
+        issued_api_token_scope=issued_api_token_scope,
+    )
 
 # ============= ACCOUNT ENDPOINTS =============
 
@@ -8421,8 +9797,7 @@ async def list_admin_accounts(
     """List sysadmin accounts by resolving PIDP users and SpiceDB admin membership."""
     if current_user.get("is_anonymous"):
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
+    _require_sysadmin(current_user, pat_required_grants=["org:admin.read", "org:*"])
     if not credentials:
         raise HTTPException(status_code=401, detail="Authentication required")
 
@@ -8768,8 +10143,11 @@ async def update_ubi_settings(
     """Update runtime UBI settings used by the UBI worker."""
     if current_user.get("is_anonymous"):
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin access required")
+    _require_sysadmin(
+        current_user,
+        pat_required_grants=["org:admin.write", "org:*"],
+        detail="SysAdmin access required",
+    )
 
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
@@ -8813,8 +10191,11 @@ async def get_business_card_abuse_settings(
 ):
     if current_user.get("is_anonymous"):
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin access required")
+    _require_sysadmin(
+        current_user,
+        pat_required_grants=["org:admin.read", "org:*"],
+        detail="SysAdmin access required",
+    )
     return await get_business_card_runtime_settings()
 
 
@@ -8825,8 +10206,11 @@ async def update_business_card_abuse_settings(
 ):
     if current_user.get("is_anonymous"):
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin access required")
+    _require_sysadmin(
+        current_user,
+        pat_required_grants=["org:admin.write", "org:*"],
+        detail="SysAdmin access required",
+    )
 
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
@@ -8885,8 +10269,11 @@ async def get_business_card_submission_image(
 ):
     if current_user.get("is_anonymous"):
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin access required")
+    _require_sysadmin(
+        current_user,
+        pat_required_grants=["org:admin.read", "org:*"],
+        detail="SysAdmin access required",
+    )
 
     submission = (
         session.query(BusinessCardSubmission)
@@ -8924,8 +10311,11 @@ async def list_business_card_submissions(
 ):
     if current_user.get("is_anonymous"):
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin access required")
+    _require_sysadmin(
+        current_user,
+        pat_required_grants=["org:admin.read", "org:*"],
+        detail="SysAdmin access required",
+    )
     safe_limit = max(1, min(limit, 1000))
     safe_offset = max(0, min(offset, 100000))
     rows = (
@@ -10077,7 +11467,7 @@ async def withdraw_governance_motion(
     _require_authenticated_user(current_user)
     motion = _get_governance_motion_or_404(session, motion_id)
     user_id = _actor_user_id(current_user)
-    if motion.proposer_user_id != user_id and not _is_sysadmin(current_user):
+    if motion.proposer_user_id != user_id and not _can_use_sysadmin_override(current_user, ["org:admin.write", "org:*"]):
         raise HTTPException(status_code=403, detail="Only the proposer or an admin can withdraw this motion")
     if motion.status != GovernanceMotionStatus.PROPOSED.value:
         raise HTTPException(status_code=400, detail="Only proposed motions can be withdrawn")
@@ -10130,8 +11520,7 @@ async def execute_governance_dissolution(
 ):
     """Record execution of a passed dissolution decision and asset disposition action."""
     _require_authenticated_user(current_user)
-    if not _is_sysadmin(current_user):
-        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
+    _require_sysadmin(current_user, pat_required_grants=["org:admin.write", "org:*"])
     motion = _get_governance_motion_or_404(session, motion_id)
     if motion.type != GovernanceMotionType.DISSOLUTION.value:
         raise HTTPException(status_code=422, detail="Motion is not a dissolution motion")

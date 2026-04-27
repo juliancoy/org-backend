@@ -104,6 +104,21 @@ Backend enforcement:
 - Explicit class separation: `SysAdmin` and `Org Admin` are distinct and should not be conflated.
 - Deny by default: any missing/failed auth or role check must return `401/403`.
 
+## Enforcement Model (Current Best Practice)
+- Use a hybrid model:
+  - `RBAC` for actor class checks (`SysAdmin`, `Org Admin`, `Member`, `Attendee`, `Public`).
+  - `ABAC` for token attributes (`token_kind`, PAT `scope`, PAT `scope_grants`) and request/resource context.
+- For sensitive SysAdmin APIs:
+  - JWT session tokens are accepted for interactive admins.
+  - PAT callers must satisfy both:
+    - actor role check (`is_sysadmin == true`)
+    - grant check (for example `org:admin.read` for reads, `org:admin.write` for mutations, or `org:*`).
+- This prevents over-privileged PAT use even when a token owner is a platform admin.
+
+## ReBAC Positioning
+- `ReBAC` should be added where permissions are relationship-heavy and contextual (for example `viewer -> org -> team -> resource`), especially for organization/team/resource sharing.
+- Existing SpiceDB integration remains the right substrate for this next phase.
+
 ## Operational Guidance
 - Bootstrap a platform admin by setting:
   - `ORG_SYSADMIN_USER_IDS="<pidp_user_id>[,<pidp_user_id>...]"`

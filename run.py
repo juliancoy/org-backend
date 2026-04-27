@@ -288,6 +288,7 @@ def _common_env(
         "REDIS_PASSWORD": os.getenv("ORG_REDIS_PASSWORD", ""),
         "PIDP_JWKS_URL": os.getenv("ORG_PIDP_JWKS_URL", f"http://{prefix}pidp-dev:8000/.well-known/jwks.json"),
         "PIDP_BASE_URL": os.getenv("ORG_PIDP_BASE_URL", f"http://{prefix}pidp-dev:8000"),
+        "PIDP_APP_SLUG": os.getenv("ORG_PIDP_APP_SLUG", "code-collective"),
         "PIDP_JWT_ISSUER": os.getenv("PIDP_JWT_ISSUER", ""),
         "PIDP_JWT_AUDIENCE": os.getenv("PIDP_JWT_AUDIENCE", ""),
         "COCKROACH_DB_URL": cockroach_sync,

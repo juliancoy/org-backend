@@ -71,3 +71,66 @@ def test_resolve_access_classes_for_sysadmin(monkeypatch):
     assert snapshot.is_sysadmin is True
     assert snapshot.is_org_admin is True
     assert snapshot.is_member is True
+
+
+def test_has_required_pat_grant_accepts_wildcard_and_exact():
+    pat_user = {
+        "token_kind": "pat",
+        "token_scope_grants": ["org:admin.read", "org:*"],
+    }
+    assert backend._has_required_pat_grant(pat_user, ["org:admin.read"]) is True
+    assert backend._has_required_pat_grant(pat_user, ["org:admin.write"]) is True
+
+
+def test_has_required_pat_grant_rejects_missing_grant_for_pat():
+    pat_user = {
+        "token_kind": "pat",
+        "token_scope_grants": ["org:profile.read"],
+    }
+    assert backend._has_required_pat_grant(pat_user, ["org:admin.read"]) is False
+
+
+def test_has_required_pat_grant_does_not_block_jwt_sessions():
+    jwt_user = {
+        "token_kind": "jwt",
+        "token_scope_grants": [],
+    }
+    assert backend._has_required_pat_grant(jwt_user, ["org:admin.read"]) is True
+
+
+def test_require_sysadmin_blocks_missing_pat_grants():
+    user = {
+        "is_sysadmin": True,
+        "token_kind": "pat",
+        "token_scope_grants": ["org:profile.read"],
+    }
+    try:
+        backend._require_sysadmin(user, pat_required_grants=["org:admin.write", "org:*"])
+    except backend.HTTPException as exc:
+        assert exc.status_code == 403
+        assert "required grant" in str(exc.detail).lower()
+    else:
+        raise AssertionError("Expected HTTPException for missing PAT grant")
+
+
+def test_can_use_sysadmin_override_requires_sysadmin_and_grant_for_pat():
+    pat_user_without_grant = {
+        "is_sysadmin": True,
+        "token_kind": "pat",
+        "token_scope_grants": ["org:profile.read"],
+    }
+    assert backend._can_use_sysadmin_override(pat_user_without_grant, ["org:admin.write", "org:*"]) is False
+
+    pat_user_with_grant = {
+        "is_sysadmin": True,
+        "token_kind": "pat",
+        "token_scope_grants": ["org:admin.write"],
+    }
+    assert backend._can_use_sysadmin_override(pat_user_with_grant, ["org:admin.write", "org:*"]) is True
+
+    jwt_sysadmin_user = {
+        "is_sysadmin": True,
+        "token_kind": "jwt",
+        "token_scope_grants": [],
+    }
+    assert backend._can_use_sysadmin_override(jwt_sysadmin_user, ["org:admin.write", "org:*"]) is True
