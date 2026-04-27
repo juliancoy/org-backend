@@ -1,13 +1,17 @@
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Request, Query
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Request, Query, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, validator, Field
-from typing import List, Optional, Dict, Any, Set, Annotated
+from pydantic import BaseModel, Field, ConfigDict, field_validator
+from typing import List, Optional, Dict, Any, Set, Annotated, Callable
 from enum import Enum
 import uuid
 from datetime import datetime, timezone, date, timedelta
 from decimal import Decimal, ROUND_DOWN
 import hashlib
+import hmac
+import ipaddress
 import random
 import json
 import os
@@ -16,13 +20,28 @@ import asyncio
 import re
 import ast
 import secrets
+import base64
+import smtplib
+import socket
+from email.message import EmailMessage
 from pathlib import Path
+from urllib.parse import quote, urlparse, urljoin
+from domain.auth import extract_bearer_token
+from domain.economy import EconomicEngine as DomainEconomicEngine
+from domain.governance import is_transition_allowed
+from domain.ingest import (
+    city_from_feed_url,
+    clean_ingest_tags,
+    derive_org_name,
+    normalize_ingest_url,
+    normalize_org_source_urls,
+)
+from domain.network import slugify
 
 # Database imports
 import asyncpg
 from sqlalchemy import create_engine, Column, String, Integer, Numeric, DateTime, Date, Boolean, JSON, Text, ForeignKey, Enum as SQLEnum, CheckConstraint, Index, func
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship, declared_attr
+from sqlalchemy.orm import sessionmaker, Session, relationship, declared_attr, declarative_base
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import text, select, update, delete
 from contextlib import asynccontextmanager
@@ -36,6 +55,11 @@ import jwt
 from jwt import InvalidTokenError
 import requests
 import httpx
+from bs4 import BeautifulSoup
+try:
+    from mcp_server import mcp as org_mcp
+except Exception:
+    org_mcp = None
 
 # FastAPI app setup
 app = FastAPI(
@@ -43,6 +67,47 @@ app = FastAPI(
     description="A complete democratic economic system with UBI, stock market, insurance, and fiscal policy",
     version="2.0.0"
 )
+
+
+def _normalize_origin_entry(raw: str) -> str | None:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    if value.startswith(("http://", "https://", "capacitor://")):
+        return value.rstrip("/")
+    # Backward compatibility: bare hostnames in env become https origins.
+    return f"https://{value}".rstrip("/")
+
+
+def _parse_allowed_origins(value: str) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in (value or "").split(","):
+        candidate = _normalize_origin_entry(item)
+        if not candidate or candidate in seen:
+            continue
+        normalized.append(candidate)
+        seen.add(candidate)
+    return normalized
+
+
+_default_native_origins = "capacitor://localhost,http://localhost,http://127.0.0.1,https://localhost"
+_allowed_origins = _parse_allowed_origins(
+    ",".join(
+        [
+            os.environ.get("ALLOWED_ORIGINS", ""),
+            os.environ.get("ORG_NATIVE_ALLOWED_ORIGINS", _default_native_origins),
+        ]
+    )
+)
+if _allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Security
 security = HTTPBearer(auto_error=False)
@@ -69,15 +134,137 @@ PIDP_JWKS_URL = os.environ.get("PIDP_JWKS_URL", "http://pidp:8000/.well-known/jw
 PIDP_BASE_URL = os.environ.get("PIDP_BASE_URL", "http://pidp:8000")
 PIDP_JWT_ISSUER = os.environ.get("PIDP_JWT_ISSUER")
 PIDP_JWT_AUDIENCE = os.environ.get("PIDP_JWT_AUDIENCE")
+ORG_ALLOWED_PAT_SCOPES = {
+    item.strip()
+    for item in os.environ.get("ORG_ALLOWED_PAT_SCOPES", "org_portal,org_mcp,org_admin").split(",")
+    if item.strip()
+}
+
+
+def _parse_content_types_csv(value: str) -> set[str]:
+    parsed = {
+        item.strip().lower()
+        for item in (value or "").split(",")
+        if item.strip()
+    }
+    return parsed or {"image/jpeg", "image/png", "image/webp"}
+
+
+ORG_BUSINESS_CARD_DEFAULT_MAX_BYTES = max(
+    1024 * 1024,
+    int(os.environ.get("ORG_BUSINESS_CARD_MAX_BYTES", str(8 * 1024 * 1024))),
+)
+ORG_BUSINESS_CARD_DEFAULT_ALLOWED_CONTENT_TYPES = _parse_content_types_csv(
+    os.environ.get(
+        "ORG_BUSINESS_CARD_ALLOWED_CONTENT_TYPES",
+        "image/jpeg,image/png,image/webp",
+    )
+)
+ORG_BUSINESS_CARD_DEFAULT_ENABLED = os.environ.get(
+    "ORG_BUSINESS_CARD_ABUSE_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+ORG_BUSINESS_CARD_DEFAULT_USER_LIMIT_PER_HOUR = max(
+    1,
+    int(os.environ.get("ORG_BUSINESS_CARD_SUBMIT_PER_USER_PER_HOUR", "60")),
+)
+ORG_BUSINESS_CARD_DEFAULT_IP_LIMIT_PER_HOUR = max(
+    1,
+    int(os.environ.get("ORG_BUSINESS_CARD_SUBMIT_PER_IP_PER_HOUR", "120")),
+)
+ORG_BUSINESS_CARD_DEFAULT_GLOBAL_LIMIT_PER_HOUR = max(
+    1,
+    int(os.environ.get("ORG_BUSINESS_CARD_SUBMIT_GLOBAL_PER_HOUR", "2000")),
+)
+ORG_BUSINESS_CARD_DEFAULT_DUPLICATE_HASH_LIMIT = max(
+    1,
+    int(os.environ.get("ORG_BUSINESS_CARD_DUPLICATE_HASH_LIMIT", "3")),
+)
+ORG_BUSINESS_CARD_DEFAULT_DUPLICATE_WINDOW_SECONDS = max(
+    60,
+    int(os.environ.get("ORG_BUSINESS_CARD_DUPLICATE_WINDOW_SECONDS", str(24 * 3600))),
+)
+ORG_BUSINESS_CARD_STORAGE_ENABLED = os.environ.get(
+    "ORG_BUSINESS_CARD_STORAGE_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+ORG_BUSINESS_CARD_STORAGE_BACKEND = os.environ.get(
+    "ORG_BUSINESS_CARD_STORAGE_BACKEND",
+    "local",
+).strip().lower() or "local"
+ORG_BUSINESS_CARD_STORAGE_DIR = os.environ.get(
+    "ORG_BUSINESS_CARD_STORAGE_DIR",
+    "/var/lib/org/business-cards",
+).strip() or "/var/lib/org/business-cards"
+ORG_BUSINESS_CARD_S3_ENDPOINT_URL = os.environ.get("ORG_BUSINESS_CARD_S3_ENDPOINT_URL", "").strip()
+ORG_BUSINESS_CARD_S3_BUCKET = os.environ.get("ORG_BUSINESS_CARD_S3_BUCKET", "org-business-cards").strip() or "org-business-cards"
+ORG_BUSINESS_CARD_S3_REGION = os.environ.get("ORG_BUSINESS_CARD_S3_REGION", "us-east-1").strip() or "us-east-1"
+ORG_BUSINESS_CARD_S3_ACCESS_KEY = os.environ.get("ORG_BUSINESS_CARD_S3_ACCESS_KEY", "").strip()
+ORG_BUSINESS_CARD_S3_SECRET_KEY = os.environ.get("ORG_BUSINESS_CARD_S3_SECRET_KEY", "").strip()
+ORG_BUSINESS_CARD_S3_USE_SSL = os.environ.get("ORG_BUSINESS_CARD_S3_USE_SSL", "false").strip().lower() in {"1", "true", "yes", "on"}
+ORG_BUSINESS_CARD_S3_PREFIX = os.environ.get("ORG_BUSINESS_CARD_S3_PREFIX", "business-cards").strip().strip("/")
+ORG_BUSINESS_CARD_OCR_PROVIDER = os.environ.get(
+    "ORG_BUSINESS_CARD_OCR_PROVIDER",
+    "openai",
+).strip().lower()
+ORG_OPENAI_API_KEY = os.environ.get("ORG_OPENAI_API_KEY", "").strip()
+ORG_OPENAI_API_BASE_URL = os.environ.get("ORG_OPENAI_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+ORG_BUSINESS_CARD_OCR_MODEL = os.environ.get("ORG_BUSINESS_CARD_OCR_MODEL", "gpt-4.1-mini").strip()
+ORG_SCAN_EVENT_LINK_ENRICHMENT_ENABLED = os.environ.get(
+    "ORG_SCAN_EVENT_LINK_ENRICHMENT_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+ORG_SCAN_AI_SUMMARY_ENABLED = os.environ.get(
+    "ORG_SCAN_AI_SUMMARY_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+ORG_SCAN_AUTO_CLARIFICATION_ENABLED = os.environ.get(
+    "ORG_SCAN_AUTO_CLARIFICATION_ENABLED",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
+ORG_SCAN_AUTO_MIN_CONFIDENCE = max(
+    0.0,
+    min(1.0, float(os.environ.get("ORG_SCAN_AUTO_MIN_CONFIDENCE", "0.75"))),
+)
+ORG_SCAN_AUTO_MIN_MARGIN = max(
+    0.0,
+    min(1.0, float(os.environ.get("ORG_SCAN_AUTO_MIN_MARGIN", "0.20"))),
+)
+ORG_SMTP_HOST = os.environ.get("ORG_SMTP_HOST", "").strip()
+ORG_SMTP_PORT = int(os.environ.get("ORG_SMTP_PORT", "587"))
+ORG_SMTP_USERNAME = os.environ.get("ORG_SMTP_USERNAME", "").strip()
+ORG_SMTP_PASSWORD = os.environ.get("ORG_SMTP_PASSWORD", "").strip()
+ORG_SMTP_FROM = os.environ.get("ORG_SMTP_FROM", "").strip() or "noreply@arkavo.org"
+ORG_SMTP_STARTTLS = os.environ.get("ORG_SMTP_STARTTLS", "true").strip().lower() in {"1", "true", "yes", "on"}
+ORG_PORTAL_BASE_URL = os.environ.get("ORG_PORTAL_BASE_URL", "").strip()
+ORG_MATRIX_HOMESERVER_URL = os.environ.get("ORG_MATRIX_HOMESERVER_URL", "http://synapse:8008").rstrip("/")
+ORG_MATRIX_SERVER_NAME = os.environ.get("ORG_MATRIX_SERVER_NAME", "matrix.arkavo.org").strip()
+ORG_MATRIX_ADMIN_TOKEN = os.environ.get("ORG_MATRIX_ADMIN_TOKEN", "").strip()
+ORG_MATRIX_PASSWORD_SECRET = os.environ.get("ORG_MATRIX_PASSWORD_SECRET", "").strip()
+ORG_MATRIX_AUTO_PROVISION_PUBLIC_ORG_ROOMS = os.environ.get(
+    "ORG_MATRIX_AUTO_PROVISION_PUBLIC_ORG_ROOMS",
+    "true",
+).strip().lower() in {"1", "true", "yes", "on"}
 
 # SpiceDB (authorization)
 SPICEDB_HTTP_URL = os.environ.get("SPICEDB_HTTP_URL", "http://spicedb:8443").rstrip("/")
 SPICEDB_PRESHARED_KEY = os.environ.get("SPICEDB_PRESHARED_KEY", "")
-ORG_ADMIN_GROUP = os.environ.get("ORG_ADMIN_GROUP", "admins")
-ORG_RESOURCE_ID = os.environ.get("ORG_RESOURCE_ID", "portal")
-ORG_ADMIN_USER_IDS = [
+ORG_SYSADMIN_GROUP = os.environ.get(
+    "ORG_SYSADMIN_GROUP",
+    "admins",
+)
+ORG_SYSADMIN_RESOURCE_ID = os.environ.get(
+    "ORG_SYSADMIN_RESOURCE_ID",
+    "portal",
+)
+ORG_SYSADMIN_USER_IDS = [
     item.strip()
-    for item in os.environ.get("ORG_ADMIN_USER_IDS", "").split(",")
+    for item in os.environ.get("ORG_SYSADMIN_USER_IDS", "").split(",")
+    if item.strip()
+]
+ORG_SYSADMIN_EMAILS = [
+    item.strip().lower()
+    for item in os.environ.get("ORG_SYSADMIN_EMAILS", "").split(",")
     if item.strip()
 ]
 ORG_PUBLIC_CALENDAR_FEEDS = [
@@ -96,6 +283,23 @@ ORG_PUBLIC_CALENDAR_PULL_ENABLED = os.environ.get(
     "ORG_PUBLIC_CALENDAR_PULL_ENABLED",
     "true",
 ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+ORG_RUNTIME_ROLE = os.environ.get("ORG_RUNTIME_ROLE", "all").strip().lower() or "all"
+ORG_ENABLE_BACKGROUND_JOBS = _env_truthy("ORG_ENABLE_BACKGROUND_JOBS", default=True)
+ORG_ENABLE_SAMPLE_DATA = _env_truthy("ORG_ENABLE_SAMPLE_DATA", default=False)
+ORG_WORKER_LOCK_ENABLED = _env_truthy("ORG_WORKER_LOCK_ENABLED", default=False)
+ORG_WORKER_LOCK_SECONDS = max(
+    30,
+    int(os.environ.get("ORG_WORKER_LOCK_SECONDS", "300")),
+)
 
 # System Constants
 SYSTEM_CURRENCY = "DEM"
@@ -178,6 +382,7 @@ class EventHostType(str, Enum):
 class GovernanceMotionType(str, Enum):
     MAIN = "main"
     AMENDMENT = "amendment"
+    DISSOLUTION = "dissolution"
 
 
 class GovernanceMotionStatus(str, Enum):
@@ -668,6 +873,207 @@ class OrganizationMembership(Base):
     organization = relationship("Organization", back_populates="memberships")
 
 
+class Team(Base):
+    """Constitution-aligned team entity."""
+    __tablename__ = "teams"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(255), nullable=False, index=True)
+    slug = Column(String(255), nullable=False, unique=True, index=True)
+    description = Column(Text)
+    status = Column(String(32), nullable=False, default="active", index=True)
+    created_by_user_id = Column(String(255), index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active','inactive','archived')", name="check_team_status"),
+    )
+
+    memberships = relationship("TeamMembership", back_populates="team", cascade="all, delete-orphan")
+
+
+class TeamMembership(Base):
+    """Membership relation between users and teams."""
+    __tablename__ = "team_memberships"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String(255), nullable=False, index=True)
+    user_email = Column(String(255))
+    user_name = Column(String(255))
+    role = Column(String(50), nullable=False, default="member")  # member|lead
+    active = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_team_membership_team_user_unique", "team_id", "user_id", unique=True),
+        CheckConstraint("role IN ('member','lead')", name="check_team_membership_role"),
+    )
+
+    team = relationship("Team", back_populates="memberships")
+
+
+class EventAttendance(Base):
+    """Attendance records used to derive Attendee class eligibility."""
+    __tablename__ = "event_attendance"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_id = Column(UUID(as_uuid=True), ForeignKey("network_events.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String(255), nullable=False, index=True)
+    user_email = Column(String(255))
+    user_name = Column(String(255))
+    attended_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), index=True)
+    source = Column(String(64), nullable=False, default="self_checkin")
+    verified_by_user_id = Column(String(255), index=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+
+    __table_args__ = (
+        Index("idx_event_attendance_event_user_unique", "event_id", "user_id", unique=True),
+    )
+
+
+class BusinessCardSubmission(Base):
+    """Captured business card submission and resulting onboarding state."""
+    __tablename__ = "business_card_submissions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    submitted_by_user_id = Column(String(255), nullable=False, index=True)
+    submitted_by_email = Column(String(255))
+    submitted_by_name = Column(String(255))
+    image_filename = Column(String(512))
+    image_content_type = Column(String(100), nullable=False)
+    image_size_bytes = Column(Integer, nullable=False)
+    image_sha256 = Column(String(64), nullable=False, index=True)
+    image_storage_backend = Column(String(32))
+    image_storage_bucket = Column(String(255))
+    image_storage_path = Column(String(1024))
+    image_storage_error = Column(Text)
+    ocr_provider = Column(String(64), nullable=False)
+    ocr_text = Column(Text, nullable=False)
+    extracted_name = Column(String(255))
+    extracted_title = Column(String(255))
+    extracted_company = Column(String(255))
+    extracted_email = Column(String(255), index=True)
+    extracted_phone = Column(String(80))
+    extracted_website = Column(String(255))
+    extracted_address = Column(Text)
+    extracted_metadata = Column(JSONB, default=dict)
+    notes = Column(Text)
+    pidp_user_created = Column(Boolean, nullable=False, default=False)
+    pidp_user_id = Column(String(255), index=True)
+    notification_email_sent = Column(Boolean, nullable=False, default=False)
+    notification_error = Column(Text)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+
+    @property
+    def image_stored(self) -> bool:
+        return bool((self.image_storage_path or "").strip())
+
+    @property
+    def scan_kind_requested(self) -> str:
+        metadata = self.extracted_metadata if isinstance(self.extracted_metadata, dict) else {}
+        value = str(metadata.get("scan_kind_requested") or "").strip().lower()
+        return value or "auto"
+
+    @property
+    def scan_kind(self) -> str:
+        metadata = self.extracted_metadata if isinstance(self.extracted_metadata, dict) else {}
+        value = str(metadata.get("scan_kind") or "").strip().lower()
+        return value or "person"
+
+    @property
+    def created_target_type(self) -> Optional[str]:
+        metadata = self.extracted_metadata if isinstance(self.extracted_metadata, dict) else {}
+        value = str(metadata.get("created_target_type") or "").strip().lower()
+        return value or None
+
+    @property
+    def created_target_id(self) -> Optional[str]:
+        metadata = self.extracted_metadata if isinstance(self.extracted_metadata, dict) else {}
+        value = str(metadata.get("created_target_id") or "").strip()
+        return value or None
+
+    @property
+    def created_target_slug(self) -> Optional[str]:
+        metadata = self.extracted_metadata if isinstance(self.extracted_metadata, dict) else {}
+        value = str(metadata.get("created_target_slug") or "").strip()
+        return value or None
+
+    @property
+    def created_target_name(self) -> Optional[str]:
+        metadata = self.extracted_metadata if isinstance(self.extracted_metadata, dict) else {}
+        value = str(metadata.get("created_target_name") or "").strip()
+        return value or None
+
+    @property
+    def created_targets(self) -> List[Dict[str, Optional[str]]]:
+        metadata = self.extracted_metadata if isinstance(self.extracted_metadata, dict) else {}
+        raw_targets = metadata.get("created_targets")
+        normalized: List[Dict[str, Optional[str]]] = []
+        if isinstance(raw_targets, list):
+            for item in raw_targets:
+                if not isinstance(item, dict):
+                    continue
+                target_type = str(item.get("type") or "").strip().lower()
+                target_id = str(item.get("id") or "").strip()
+                target_slug = str(item.get("slug") or "").strip() or None
+                target_name = str(item.get("name") or "").strip() or None
+                target_url = str(item.get("url") or "").strip() or None
+                target_image_url = str(item.get("image_url") or "").strip() or None
+                target_summary = str(item.get("summary") or "").strip() or None
+                if not target_type:
+                    continue
+                normalized.append(
+                    {
+                        "type": target_type,
+                        "id": target_id or None,
+                        "slug": target_slug,
+                        "name": target_name,
+                        "url": target_url,
+                        "image_url": target_image_url,
+                        "summary": target_summary,
+                    }
+                )
+        if normalized:
+            return normalized
+        if self.created_target_type:
+            fallback_url = None
+            if self.created_target_type == "organization" and self.created_target_slug:
+                fallback_url = f"/orgs/{self.created_target_slug}"
+            elif self.created_target_type == "event" and self.created_target_slug:
+                fallback_url = f"/events/{self.created_target_slug}"
+            return [
+                {
+                    "type": self.created_target_type,
+                    "id": self.created_target_id,
+                    "slug": self.created_target_slug,
+                    "name": self.created_target_name,
+                    "url": fallback_url,
+                }
+            ]
+        return []
+
+    @property
+    def clarification_required(self) -> bool:
+        metadata = self.extracted_metadata if isinstance(self.extracted_metadata, dict) else {}
+        return bool(metadata.get("clarification_required", False))
+
+    @property
+    def clarification_message(self) -> Optional[str]:
+        metadata = self.extracted_metadata if isinstance(self.extracted_metadata, dict) else {}
+        value = str(metadata.get("clarification_message") or "").strip()
+        return value or None
+
+    @property
+    def processing_status(self) -> str:
+        metadata = self.extracted_metadata if isinstance(self.extracted_metadata, dict) else {}
+        value = str(metadata.get("processing_status") or "").strip().lower()
+        return value or "processed"
+
+
 class UserContactPage(Base):
     """Public optional contact page for a user."""
     __tablename__ = "user_contact_pages"
@@ -684,7 +1090,11 @@ class UserContactPage(Base):
     email_public = Column(String(255))
     phone_public = Column(String(64))
     linkedin_url = Column(Text)
+    github_url = Column(Text)
+    x_url = Column(Text)
     website_url = Column(Text)
+    source_profile_url = Column(Text)
+    source_profile_imported_at = Column(DateTime(timezone=True))
     links = Column(JSONB)
     created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
@@ -752,7 +1162,7 @@ class GovernanceMotion(Base):
     __table_args__ = (
         Index("idx_governance_motions_status_created", "status", "created_at"),
         CheckConstraint("quorum_required >= 1", name="check_governance_motion_quorum_positive"),
-        CheckConstraint("type IN ('main','amendment')", name="check_governance_motion_type"),
+        CheckConstraint("type IN ('main','amendment','dissolution')", name="check_governance_motion_type"),
         CheckConstraint(
             "status IN ('proposed','seconded','discussion','voting','passed','failed','tabled','withdrawn')",
             name="check_governance_motion_status",
@@ -763,6 +1173,43 @@ class GovernanceMotion(Base):
     votes = relationship("GovernanceVote", back_populates="motion", cascade="all, delete-orphan")
     comments = relationship("GovernanceComment", back_populates="motion", cascade="all, delete-orphan")
     reactions = relationship("GovernanceReaction", back_populates="motion", cascade="all, delete-orphan")
+    dissolution_plan = relationship(
+        "GovernanceDissolutionPlan",
+        back_populates="motion",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class GovernanceDissolutionPlan(Base):
+    __tablename__ = "governance_dissolution_plans"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    motion_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("governance_motions.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    asset_disposition = Column(Text, nullable=False)
+    asset_recipient_name = Column(String(255), nullable=False)
+    asset_recipient_type = Column(String(32), nullable=False, default="other_legal_entity")
+    legal_compliance_notes = Column(Text)
+    executed_at = Column(DateTime(timezone=True))
+    executed_by_user_id = Column(String(255), index=True)
+    execution_notes = Column(Text)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "asset_recipient_type IN ('non_profit','other_legal_entity')",
+            name="check_dissolution_recipient_type",
+        ),
+    )
+
+    motion = relationship("GovernanceMotion", back_populates="dissolution_plan")
 
 
 class GovernanceVote(Base):
@@ -844,8 +1291,7 @@ class AccountResponse(BaseModel):
     tax_id: Optional[str] = None
     is_verified: bool
     
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class AccountListItemResponse(BaseModel):
     id: uuid.UUID
@@ -855,8 +1301,7 @@ class AccountListItemResponse(BaseModel):
     balance: Decimal
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class MoneySupplyPointResponse(BaseModel):
     timestamp: datetime
@@ -887,9 +1332,7 @@ class TransactionResponse(BaseModel):
     reference_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = Field(None, alias="tx_metadata")
     
-    class Config:
-        from_attributes = True
-        allow_population_by_field_name = True
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 class RecentTransactionResponse(BaseModel):
     id: uuid.UUID
@@ -976,13 +1419,59 @@ class UBIRuntimeSettingsUpdate(BaseModel):
     dena_precision: Optional[int] = Field(None, ge=0, le=12)
     entity_types: Optional[List[str]] = None
 
-    @validator("entity_types")
+    @field_validator("entity_types")
+    @classmethod
     def validate_entity_types(cls, value):
         if value is None:
             return value
         cleaned = [item.strip() for item in value if item and item.strip()]
         if not cleaned:
             raise ValueError("entity_types must contain at least one value")
+        return cleaned
+
+
+class BusinessCardAbuseSettingsResponse(BaseModel):
+    enabled: bool
+    per_user_limit_per_hour: int
+    per_ip_limit_per_hour: int
+    global_limit_per_hour: int
+    duplicate_hash_limit: int
+    duplicate_hash_window_seconds: int
+    max_bytes: int
+    allowed_content_types: List[str]
+    event_link_enrichment_enabled: bool = True
+    auto_clarification_enabled: bool = True
+    auto_min_confidence: float = 0.75
+    auto_min_margin: float = 0.2
+    updated_at: datetime
+    updated_by: Optional[str] = None
+
+
+class BusinessCardAbuseSettingsUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    per_user_limit_per_hour: Optional[int] = Field(None, ge=1, le=2000)
+    per_ip_limit_per_hour: Optional[int] = Field(None, ge=1, le=10000)
+    global_limit_per_hour: Optional[int] = Field(None, ge=1, le=50000)
+    duplicate_hash_limit: Optional[int] = Field(None, ge=1, le=100)
+    duplicate_hash_window_seconds: Optional[int] = Field(None, ge=60, le=30 * 24 * 3600)
+    max_bytes: Optional[int] = Field(None, ge=1024 * 100, le=25 * 1024 * 1024)
+    allowed_content_types: Optional[List[str]] = None
+    event_link_enrichment_enabled: Optional[bool] = None
+    auto_clarification_enabled: Optional[bool] = None
+    auto_min_confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    auto_min_margin: Optional[float] = Field(None, ge=0.0, le=1.0)
+
+    @field_validator("allowed_content_types")
+    @classmethod
+    def validate_allowed_content_types(cls, value):
+        if value is None:
+            return value
+        cleaned = sorted({item.strip().lower() for item in value if item and item.strip()})
+        if not cleaned:
+            raise ValueError("allowed_content_types must contain at least one value")
+        invalid = [item for item in cleaned if "/" not in item or not item.startswith("image/")]
+        if invalid:
+            raise ValueError(f"Only image/* content types are allowed: {', '.join(invalid)}")
         return cleaned
 
 
@@ -1033,8 +1522,7 @@ class OrganizationClaimRequestResponse(BaseModel):
     reviewed_at: Optional[datetime] = None
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OrganizationClaimRequestQueueItemResponse(BaseModel):
@@ -1060,8 +1548,129 @@ class OrganizationMembershipResponse(BaseModel):
     role: str
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TeamCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+
+
+class TeamMembershipUpsert(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=255)
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
+    role: str = Field("member", pattern="^(member|lead)$")
+    active: bool = True
+
+
+class TeamMembershipResponse(BaseModel):
+    user_id: str
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
+    role: str
+    active: bool
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TeamResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    slug: str
+    description: Optional[str] = None
+    status: str
+    created_by_user_id: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class EventAttendanceRecordResponse(BaseModel):
+    id: uuid.UUID
+    event_id: uuid.UUID
+    user_id: str
+    user_email: Optional[str] = None
+    user_name: Optional[str] = None
+    attended_at: datetime
+    source: str
+    verified_by_user_id: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class BusinessCardSubmissionResponse(BaseModel):
+    id: uuid.UUID
+    submitted_by_user_id: str
+    image_filename: Optional[str] = None
+    image_content_type: str
+    image_size_bytes: int
+    image_stored: bool = False
+    ocr_provider: str
+    extracted_name: Optional[str] = None
+    extracted_title: Optional[str] = None
+    extracted_company: Optional[str] = None
+    extracted_email: Optional[str] = None
+    extracted_phone: Optional[str] = None
+    extracted_website: Optional[str] = None
+    extracted_address: Optional[str] = None
+    scan_kind_requested: str = "auto"
+    scan_kind: str = "person"
+    created_target_type: Optional[str] = None
+    created_target_id: Optional[str] = None
+    created_target_slug: Optional[str] = None
+    created_target_name: Optional[str] = None
+    created_targets: List[Dict[str, Optional[str]]] = Field(default_factory=list)
+    clarification_required: bool = False
+    clarification_message: Optional[str] = None
+    processing_status: str = "processed"
+    extracted_metadata: Dict[str, Any] = Field(default_factory=dict)
+    pidp_user_created: bool
+    pidp_user_id: Optional[str] = None
+    notification_email_sent: bool
+    notification_error: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MatrixBootstrapSessionResponse(BaseModel):
+    access_token: str
+    user_id: str
+    device_id: Optional[str] = None
+    homeserver_url: str
+
+
+class OrgChatRoomDirectoryItemResponse(BaseModel):
+    organization_id: uuid.UUID
+    organization_name: str
+    organization_slug: str
+    relationship_status: str = Field(..., pattern="^(attendee|member|admin)$")
+    room_id: str
+    room_alias: Optional[str] = None
+    room_name: Optional[str] = None
+
+
+class ChatLinkPreviewResponse(BaseModel):
+    url: str
+    canonical_url: str
+    title: Optional[str] = None
+    description: Optional[str] = None
+    image_url: Optional[str] = None
+    site_name: Optional[str] = None
+    domain: Optional[str] = None
+
+
+class AccessClassSnapshotResponse(BaseModel):
+    is_public: bool
+    is_attendee: bool
+    is_member: bool
+    is_org_admin: bool
+    is_sysadmin: bool
+    reasons: List[str] = Field(default_factory=list)
 
 
 class OrganizationResponse(BaseModel):
@@ -1081,8 +1690,7 @@ class OrganizationResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PublicOrganizationResponse(BaseModel):
@@ -1102,8 +1710,7 @@ class PublicOrganizationResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PublicOrganizationListItemResponse(BaseModel):
@@ -1123,8 +1730,7 @@ class PublicOrganizationListItemResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class PublicOrganizationAdminResponse(BaseModel):
@@ -1173,17 +1779,17 @@ class NetworkEventResponse(BaseModel):
     claimed_by_user_id: Optional[str] = None
     created_by_user_id: Optional[str] = None
     seeded_from_events: bool
+    represented_in_codecollective_source: bool
     is_unclaimed: bool
     my_host_role: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class GovernanceMotionCreate(BaseModel):
-    type: str = Field(GovernanceMotionType.MAIN.value, pattern="^(main|amendment)$")
+    type: str = Field(GovernanceMotionType.MAIN.value, pattern="^(main|amendment|dissolution)$")
     parent_motion_id: Optional[uuid.UUID] = None
     title: str = Field(..., min_length=1, max_length=255)
     body: str = Field(..., min_length=1)
@@ -1191,6 +1797,19 @@ class GovernanceMotionCreate(BaseModel):
     proposer_type: str = Field(GovernanceProposerType.USER.value, pattern="^(user|org)$")
     proposer_org_id: Optional[uuid.UUID] = None
     quorum_required: int = Field(5, ge=1, le=100000)
+    dissolution_asset_disposition: Optional[str] = None
+    dissolution_asset_recipient_name: Optional[str] = None
+    dissolution_asset_recipient_type: Optional[str] = Field(
+        None,
+        pattern="^(non_profit|other_legal_entity)$",
+    )
+    dissolution_legal_compliance_notes: Optional[str] = None
+
+
+class NetworkEventPublicFeedResponse(BaseModel):
+    generated_at: datetime
+    total: int
+    events: List[NetworkEventResponse] = Field(default_factory=list)
 
 
 class GovernanceMotionResponse(BaseModel):
@@ -1212,6 +1831,7 @@ class GovernanceMotionResponse(BaseModel):
     discussion_deadline: Optional[datetime] = None
     voting_deadline: Optional[datetime] = None
     quorum_required: int
+    is_dissolution: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -1253,8 +1873,30 @@ class GovernanceVoteResultResponse(BaseModel):
     nay: int = 0
     abstain: int = 0
     total_eligible: int = 0
+    participating_voters: int = 0
+    threshold_rule: str = "simple_majority"
+    required_yea: int = 0
     quorum_met: bool = False
     passed: bool = False
+
+
+class GovernanceDissolutionPlanResponse(BaseModel):
+    motion_id: uuid.UUID
+    asset_disposition: str
+    asset_recipient_name: str
+    asset_recipient_type: str
+    legal_compliance_notes: Optional[str] = None
+    executed_at: Optional[datetime] = None
+    executed_by_user_id: Optional[str] = None
+    execution_notes: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GovernanceDissolutionExecuteRequest(BaseModel):
+    execution_notes: Optional[str] = Field(None, max_length=5000)
 
 
 class CalendarIngestOrganization(BaseModel):
@@ -1318,8 +1960,41 @@ class ContactPageUpdate(BaseModel):
     email_public: Optional[str] = None
     phone_public: Optional[str] = Field(None, max_length=64)
     linkedin_url: Optional[str] = None
+    github_url: Optional[str] = None
+    x_url: Optional[str] = None
     website_url: Optional[str] = None
     links: Optional[List[ContactLink]] = None
+
+    @field_validator("email_public")
+    @classmethod
+    def _validate_email_public(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip().lower()
+        if not cleaned:
+            return None
+        if not re.fullmatch(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}$", cleaned):
+            raise ValueError("email_public must be a valid email address")
+        return cleaned
+
+    @field_validator("phone_public")
+    @classmethod
+    def _validate_phone_public(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        normalized = re.sub(r"[\s().-]+", "", cleaned)
+        if normalized.startswith("+"):
+            digits = normalized[1:]
+            candidate = f"+{digits}"
+        else:
+            digits = normalized
+            candidate = digits
+        if not digits.isdigit() or len(digits) < 7 or len(digits) > 15:
+            raise ValueError("phone_public must contain 7-15 digits")
+        return candidate
 
 
 class ContactPageResponse(BaseModel):
@@ -1333,7 +2008,11 @@ class ContactPageResponse(BaseModel):
     email_public: Optional[str] = None
     phone_public: Optional[str] = None
     linkedin_url: Optional[str] = None
+    github_url: Optional[str] = None
+    x_url: Optional[str] = None
     website_url: Optional[str] = None
+    source_profile_url: Optional[str] = None
+    source_profile_imported_at: Optional[datetime] = None
     links: List[ContactLink] = Field(default_factory=list)
     public_url: Optional[str] = None
     updated_at: datetime
@@ -1349,6 +2028,8 @@ class PublicUserProfileResponse(BaseModel):
     email_public: Optional[str] = None
     phone_public: Optional[str] = None
     linkedin_url: Optional[str] = None
+    github_url: Optional[str] = None
+    x_url: Optional[str] = None
     website_url: Optional[str] = None
     links: List[ContactLink] = Field(default_factory=list)
     public_url: Optional[str] = None
@@ -1364,6 +2045,29 @@ class PublicUserListItemResponse(BaseModel):
     photo_url: Optional[str] = None
     upcoming_events_count: int = 0
     updated_at: datetime
+
+
+class NetworkUserListItemResponse(BaseModel):
+    user_id: str
+    user_name: str
+    email: str
+    created_at: datetime
+    contact_slug: Optional[str] = None
+    contact_enabled: bool = False
+    headline: Optional[str] = None
+    photo_url: Optional[str] = None
+
+
+class ContactImportPayload(BaseModel):
+    source_url: str = Field(..., min_length=1, max_length=1000)
+    overwrite: bool = True
+
+
+class ContactImportResponse(BaseModel):
+    contact: ContactPageResponse
+    imported_fields: List[str] = Field(default_factory=list)
+    source_url: str
+
 
 # ============= DATABASE DEPENDENCY =============
 
@@ -1490,6 +2194,162 @@ def _parse_entity_types_csv(value: str) -> list[str]:
     return parsed or ["individual"]
 
 
+def _default_business_card_runtime_settings() -> dict:
+    return {
+        "enabled": ORG_BUSINESS_CARD_DEFAULT_ENABLED,
+        "per_user_limit_per_hour": ORG_BUSINESS_CARD_DEFAULT_USER_LIMIT_PER_HOUR,
+        "per_ip_limit_per_hour": ORG_BUSINESS_CARD_DEFAULT_IP_LIMIT_PER_HOUR,
+        "global_limit_per_hour": ORG_BUSINESS_CARD_DEFAULT_GLOBAL_LIMIT_PER_HOUR,
+        "duplicate_hash_limit": ORG_BUSINESS_CARD_DEFAULT_DUPLICATE_HASH_LIMIT,
+        "duplicate_hash_window_seconds": ORG_BUSINESS_CARD_DEFAULT_DUPLICATE_WINDOW_SECONDS,
+        "max_bytes": ORG_BUSINESS_CARD_DEFAULT_MAX_BYTES,
+        "allowed_content_types": sorted(ORG_BUSINESS_CARD_DEFAULT_ALLOWED_CONTENT_TYPES),
+        "event_link_enrichment_enabled": ORG_SCAN_EVENT_LINK_ENRICHMENT_ENABLED,
+        "auto_clarification_enabled": ORG_SCAN_AUTO_CLARIFICATION_ENABLED,
+        "auto_min_confidence": ORG_SCAN_AUTO_MIN_CONFIDENCE,
+        "auto_min_margin": ORG_SCAN_AUTO_MIN_MARGIN,
+        "updated_at": datetime.now(timezone.utc),
+        "updated_by": None,
+    }
+
+
+def _parse_content_types_runtime_csv(value: str) -> list[str]:
+    parsed = sorted(_parse_content_types_csv(value))
+    return parsed or sorted(ORG_BUSINESS_CARD_DEFAULT_ALLOWED_CONTENT_TYPES)
+
+
+async def ensure_business_card_runtime_settings_table() -> None:
+    default_content_types_csv = ",".join(sorted(ORG_BUSINESS_CARD_DEFAULT_ALLOWED_CONTENT_TYPES))
+    async with db.async_pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS business_card_runtime_settings (
+                id INT PRIMARY KEY CHECK (id = 1),
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                per_user_limit_per_hour INT NOT NULL,
+                per_ip_limit_per_hour INT NOT NULL,
+                global_limit_per_hour INT NOT NULL,
+                duplicate_hash_limit INT NOT NULL,
+                duplicate_hash_window_seconds INT NOT NULL,
+                max_bytes INT NOT NULL,
+                allowed_content_types TEXT NOT NULL,
+                event_link_enrichment_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                auto_clarification_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                auto_min_confidence DOUBLE PRECISION NOT NULL DEFAULT 0.75,
+                auto_min_margin DOUBLE PRECISION NOT NULL DEFAULT 0.20,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_by TEXT
+            )
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE business_card_runtime_settings
+            ADD COLUMN IF NOT EXISTS event_link_enrichment_enabled BOOLEAN NOT NULL DEFAULT TRUE
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE business_card_runtime_settings
+            ADD COLUMN IF NOT EXISTS auto_clarification_enabled BOOLEAN NOT NULL DEFAULT TRUE
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE business_card_runtime_settings
+            ADD COLUMN IF NOT EXISTS auto_min_confidence DOUBLE PRECISION NOT NULL DEFAULT 0.75
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE business_card_runtime_settings
+            ADD COLUMN IF NOT EXISTS auto_min_margin DOUBLE PRECISION NOT NULL DEFAULT 0.20
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO business_card_runtime_settings (
+                id,
+                enabled,
+                per_user_limit_per_hour,
+                per_ip_limit_per_hour,
+                global_limit_per_hour,
+                duplicate_hash_limit,
+                duplicate_hash_window_seconds,
+                max_bytes,
+                allowed_content_types,
+                event_link_enrichment_enabled,
+                auto_clarification_enabled,
+                auto_min_confidence,
+                auto_min_margin,
+                updated_by
+            )
+            VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'org-backend-bootstrap')
+            ON CONFLICT (id) DO NOTHING
+            """,
+            ORG_BUSINESS_CARD_DEFAULT_ENABLED,
+            ORG_BUSINESS_CARD_DEFAULT_USER_LIMIT_PER_HOUR,
+            ORG_BUSINESS_CARD_DEFAULT_IP_LIMIT_PER_HOUR,
+            ORG_BUSINESS_CARD_DEFAULT_GLOBAL_LIMIT_PER_HOUR,
+            ORG_BUSINESS_CARD_DEFAULT_DUPLICATE_HASH_LIMIT,
+            ORG_BUSINESS_CARD_DEFAULT_DUPLICATE_WINDOW_SECONDS,
+            ORG_BUSINESS_CARD_DEFAULT_MAX_BYTES,
+            default_content_types_csv,
+            ORG_SCAN_EVENT_LINK_ENRICHMENT_ENABLED,
+            ORG_SCAN_AUTO_CLARIFICATION_ENABLED,
+            ORG_SCAN_AUTO_MIN_CONFIDENCE,
+            ORG_SCAN_AUTO_MIN_MARGIN,
+        )
+
+
+async def get_business_card_runtime_settings() -> dict:
+    try:
+        await ensure_business_card_runtime_settings_table()
+        async with db.async_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    enabled,
+                    per_user_limit_per_hour,
+                    per_ip_limit_per_hour,
+                    global_limit_per_hour,
+                    duplicate_hash_limit,
+                    duplicate_hash_window_seconds,
+                    max_bytes,
+                    allowed_content_types,
+                    event_link_enrichment_enabled,
+                    auto_clarification_enabled,
+                    auto_min_confidence,
+                    auto_min_margin,
+                    updated_at,
+                    updated_by
+                FROM business_card_runtime_settings
+                WHERE id = 1
+                """
+            )
+    except Exception as exc:
+        logger.warning(f"Business card runtime settings unavailable, using defaults: {exc}")
+        return _default_business_card_runtime_settings()
+    if not row:
+        return _default_business_card_runtime_settings()
+    return {
+        "enabled": bool(row["enabled"]),
+        "per_user_limit_per_hour": int(row["per_user_limit_per_hour"]),
+        "per_ip_limit_per_hour": int(row["per_ip_limit_per_hour"]),
+        "global_limit_per_hour": int(row["global_limit_per_hour"]),
+        "duplicate_hash_limit": int(row["duplicate_hash_limit"]),
+        "duplicate_hash_window_seconds": int(row["duplicate_hash_window_seconds"]),
+        "max_bytes": int(row["max_bytes"]),
+        "allowed_content_types": _parse_content_types_runtime_csv(str(row["allowed_content_types"] or "")),
+        "event_link_enrichment_enabled": bool(row["event_link_enrichment_enabled"]),
+        "auto_clarification_enabled": bool(row["auto_clarification_enabled"]),
+        "auto_min_confidence": float(row["auto_min_confidence"]),
+        "auto_min_margin": float(row["auto_min_margin"]),
+        "updated_at": row["updated_at"],
+        "updated_by": row["updated_by"],
+    }
+
+
 async def get_ubi_runtime_settings() -> dict:
     try:
         await ensure_ubi_runtime_settings_table()
@@ -1603,11 +2463,11 @@ async def _spicedb_write_relationships(relationships: list[dict]) -> None:
         )
 
 
-async def _spicedb_check_admin(user_id: str) -> bool:
+async def _spicedb_check_sysadmin(user_id: str) -> bool:
     if not _spicedb_enabled():
         return False
     payload = {
-        "resource": {"objectType": "org", "objectId": ORG_RESOURCE_ID},
+        "resource": {"objectType": "org", "objectId": ORG_SYSADMIN_RESOURCE_ID},
         "permission": "db_admin",
         "subject": {"object": {"objectType": "user", "objectId": user_id}},
     }
@@ -1631,6 +2491,51 @@ def _ensure_network_ingest_schema() -> None:
         "ALTER TABLE IF EXISTS organizations ADD COLUMN IF NOT EXISTS source_urls JSONB",
         "CREATE INDEX IF NOT EXISTS idx_organizations_source_urls_gin ON organizations USING GIN (source_urls)",
         "UPDATE organizations SET source_urls = jsonb_build_array(source_url) WHERE source_url IS NOT NULL AND (source_urls IS NULL OR jsonb_typeof(source_urls) <> 'array' OR jsonb_array_length(source_urls) = 0)",
+        "ALTER TABLE IF EXISTS business_card_submissions ADD COLUMN IF NOT EXISTS image_storage_backend VARCHAR(32)",
+        "ALTER TABLE IF EXISTS business_card_submissions ADD COLUMN IF NOT EXISTS image_storage_bucket VARCHAR(255)",
+        "ALTER TABLE IF EXISTS business_card_submissions ADD COLUMN IF NOT EXISTS image_storage_path VARCHAR(1024)",
+        "ALTER TABLE IF EXISTS business_card_submissions ADD COLUMN IF NOT EXISTS image_storage_error TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_business_card_submissions_sha_created ON business_card_submissions (image_sha256, created_at)",
+        "ALTER TABLE IF EXISTS user_contact_pages ADD COLUMN IF NOT EXISTS github_url TEXT",
+        "ALTER TABLE IF EXISTS user_contact_pages ADD COLUMN IF NOT EXISTS x_url TEXT",
+        "ALTER TABLE IF EXISTS user_contact_pages ADD COLUMN IF NOT EXISTS source_profile_url TEXT",
+        "ALTER TABLE IF EXISTS user_contact_pages ADD COLUMN IF NOT EXISTS source_profile_imported_at TIMESTAMPTZ",
+    ]
+    with db.engine.begin() as conn:
+        for statement in statements:
+            conn.execute(text(statement))
+
+
+def _ensure_governance_dissolution_schema() -> None:
+    """Apply online schema updates for dissolution governance flows."""
+    statements = [
+        "ALTER TABLE IF EXISTS governance_motions DROP CONSTRAINT IF EXISTS check_governance_motion_type",
+        (
+            "ALTER TABLE IF EXISTS governance_motions "
+            "ADD CONSTRAINT check_governance_motion_type "
+            "CHECK (type IN ('main','amendment','dissolution'))"
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS governance_dissolution_plans ("
+            "id UUID PRIMARY KEY, "
+            "motion_id UUID NOT NULL UNIQUE REFERENCES governance_motions(id) ON DELETE CASCADE, "
+            "asset_disposition TEXT NOT NULL, "
+            "asset_recipient_name VARCHAR(255) NOT NULL, "
+            "asset_recipient_type VARCHAR(32) NOT NULL DEFAULT 'other_legal_entity', "
+            "legal_compliance_notes TEXT, "
+            "executed_at TIMESTAMPTZ, "
+            "executed_by_user_id VARCHAR(255), "
+            "execution_notes TEXT, "
+            "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+            "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+            "CONSTRAINT check_dissolution_recipient_type "
+            "CHECK (asset_recipient_type IN ('non_profit','other_legal_entity'))"
+            ")"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_governance_dissolution_plans_executed_by "
+            "ON governance_dissolution_plans (executed_by_user_id)"
+        ),
     ]
     with db.engine.begin() as conn:
         for statement in statements:
@@ -1650,7 +2555,27 @@ async def lifespan(app: FastAPI):
         logger.info("Network ingest schema verified/updated")
     except Exception as exc:
         logger.warning(f"Network ingest schema migration skipped: {exc}")
+    try:
+        _ensure_governance_dissolution_schema()
+        logger.info("Governance dissolution schema verified/updated")
+    except Exception as exc:
+        logger.warning(f"Governance dissolution schema migration skipped: {exc}")
     await ensure_ubi_runtime_settings_table()
+    await ensure_business_card_runtime_settings_table()
+    if ORG_BUSINESS_CARD_STORAGE_ENABLED:
+        try:
+            if _business_card_storage_backend() == "s3":
+                _ensure_business_card_s3_bucket()
+                logger.info(
+                    "Business card S3 storage verified: bucket=%s endpoint=%s",
+                    ORG_BUSINESS_CARD_S3_BUCKET,
+                    ORG_BUSINESS_CARD_S3_ENDPOINT_URL or "aws-default",
+                )
+            else:
+                _business_card_storage_root().mkdir(parents=True, exist_ok=True)
+                logger.info("Business card storage directory verified: %s", _business_card_storage_root())
+        except Exception as exc:
+            logger.warning("Business card storage unavailable: %s", exc)
     session = None
     try:
         session = db.SessionLocal()
@@ -1676,16 +2601,16 @@ async def lifespan(app: FastAPI):
         relationships: list[dict] = [
             _spicedb_relationship(
                 "org",
-                ORG_RESOURCE_ID,
+                ORG_SYSADMIN_RESOURCE_ID,
                 "admin",
                 "group",
-                ORG_ADMIN_GROUP,
+                ORG_SYSADMIN_GROUP,
                 "member",
             )
         ]
-        for admin_id in ORG_ADMIN_USER_IDS:
+        for admin_id in ORG_SYSADMIN_USER_IDS:
             relationships.append(
-                _spicedb_relationship("group", ORG_ADMIN_GROUP, "member", "user", admin_id)
+                _spicedb_relationship("group", ORG_SYSADMIN_GROUP, "member", "user", admin_id)
             )
         await _spicedb_write_relationships(relationships)
     except Exception as exc:
@@ -1694,8 +2619,14 @@ async def lifespan(app: FastAPI):
     public_calendar_task: Optional[asyncio.Task] = None
     if ORG_PUBLIC_CALENDAR_PULL_ENABLED and ORG_PUBLIC_CALENDAR_FEEDS:
         public_calendar_task = asyncio.create_task(_public_calendar_pull_loop())
+    worker_tasks = await _start_embedded_worker_tasks()
 
     yield
+
+    if worker_tasks:
+        for task in worker_tasks:
+            task.cancel()
+        await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     if public_calendar_task:
         public_calendar_task.cancel()
@@ -1707,6 +2638,19 @@ async def lifespan(app: FastAPI):
     await db.disconnect()
 
 app = FastAPI(lifespan=lifespan)
+
+if org_mcp is not None:
+    try:
+        if hasattr(org_mcp, "streamable_http_app"):
+            app.mount("/mcp", org_mcp.streamable_http_app())
+            logger.info("Mounted Org MCP server at /mcp (streamable HTTP)")
+        elif hasattr(org_mcp, "sse_app"):
+            app.mount("/mcp", org_mcp.sse_app())
+            logger.info("Mounted Org MCP server at /mcp (SSE)")
+        else:
+            logger.warning("Org MCP server loaded but no compatible ASGI app factory was found")
+    except Exception as exc:
+        logger.warning(f"Failed to mount Org MCP server: {exc}")
 
 # Dependency for database session
 def get_db():
@@ -1723,30 +2667,88 @@ async def get_async_db():
 
 # ============= AUTHENTICATION =============
 
+def _is_sysadmin(current_user: dict) -> bool:
+    return bool(current_user.get("is_sysadmin"))
+
+
+async def _fetch_pidp_identity(token: str) -> dict[str, Any]:
+    timeout = httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0)
+    auth_headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        auth_resp = await client.get(
+            f"{PIDP_BASE_URL}/auth/me",
+            headers=auth_headers,
+        )
+
+        if auth_resp.is_success:
+            pidp_user = auth_resp.json()
+            user_id = str(pidp_user.get("id") or "").strip()
+            email = str(pidp_user.get("email") or "").strip()
+            name = str(pidp_user.get("full_name") or email or "User").strip()
+            pidp_is_sysadmin = bool(pidp_user.get("is_sysadmin"))
+            if not user_id or not email:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            return {
+                "pidp_id": user_id,
+                "email": email,
+                "name": name,
+                "pidp_is_sysadmin": pidp_is_sysadmin,
+                "token_kind": "jwt",
+                "token_scope": "session",
+                "token_scope_grants": ["session:*"],
+            }
+
+        service_resp = await client.get(
+            f"{PIDP_BASE_URL}/service/token-info",
+            headers=auth_headers,
+        )
+        if not service_resp.is_success:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        token_info = service_resp.json()
+        token_kind = str(token_info.get("token_kind") or "").strip().lower()
+        scope = str(token_info.get("scope") or "").strip()
+        owner = token_info.get("owner") or {}
+        user_id = str(owner.get("id") or "").strip()
+        email = str(owner.get("email") or "").strip()
+        name = str(owner.get("full_name") or email or "User").strip()
+        pidp_is_sysadmin = bool(owner.get("is_sysadmin"))
+        if not user_id or not email:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        if token_kind == "pat":
+            if not scope or scope not in ORG_ALLOWED_PAT_SCOPES:
+                allowed = ", ".join(sorted(ORG_ALLOWED_PAT_SCOPES))
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"PAT scope '{scope or 'none'}' is not allowed for Org backend. Allowed scopes: {allowed}",
+                )
+
+        return {
+            "pidp_id": user_id,
+            "email": email,
+            "name": name,
+            "pidp_is_sysadmin": pidp_is_sysadmin,
+            "token_kind": token_kind or "unknown",
+            "token_scope": scope or "unknown",
+            "token_scope_grants": token_info.get("scope_grants") or [],
+        }
+
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     session: Session = Depends(get_db)
 ):
     if not credentials:
-        # For demo purposes, allow anonymous users with limited access
-        return {"id": str(uuid.uuid4()), "email": "anonymous@demo.com", "name": "Anonymous", "is_anonymous": True, "is_admin": False}
+        raise HTTPException(status_code=401, detail="Authentication required")
     
     token = credentials.credentials
     
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{PIDP_BASE_URL}/auth/me",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        if not resp.is_success:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        pidp_user = resp.json()
-        user_id = str(pidp_user.get("id"))
-        email = pidp_user.get("email")
-        name = pidp_user.get("full_name") or email or "User"
-        if not user_id or not email:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+        identity = await _fetch_pidp_identity(token)
+        user_id = identity["pidp_id"]
+        email = identity["email"]
+        name = identity["name"]
 
         # Find or create account
         account = session.query(Account).filter_by(email=email).first()
@@ -1761,18 +2763,25 @@ async def get_current_user(
             session.add(account)
             session.commit()
 
-        # Allow an explicit env-based admin override for recovery/bootstrap.
-        # This keeps admin access possible even if SpiceDB is unavailable/misconfigured.
-        is_admin = user_id in ORG_ADMIN_USER_IDS or await _spicedb_check_admin(user_id)
+        # Prefer PIdP-provided platform admin claim as the source of truth.
+        # Keep local checks as break-glass fallback for recovery/bootstrap.
+        pidp_is_sysadmin = bool(identity.get("pidp_is_sysadmin"))
+        break_glass_is_sysadmin = user_id in ORG_SYSADMIN_USER_IDS or await _spicedb_check_sysadmin(user_id)
+        is_sysadmin = pidp_is_sysadmin or break_glass_is_sysadmin
         return {
             "id": str(account.id),
             "email": account.email,
             "name": account.name,
             "is_anonymous": False,
-            "is_admin": is_admin,
+            "is_sysadmin": is_sysadmin,
             "pidp_id": user_id,
+            "token_kind": identity.get("token_kind"),
+            "token_scope": identity.get("token_scope"),
+            "token_scope_grants": identity.get("token_scope_grants") or [],
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Authentication error: {e}")
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -1787,11 +2796,1273 @@ def _actor_user_id(current_user: dict) -> str:
     return str(current_user.get("pidp_id") or current_user.get("id") or "")
 
 
+def _normalize_business_card_text(value: str) -> str:
+    lines = [line.strip() for line in (value or "").splitlines()]
+    return "\n".join([line for line in lines if line])
+
+
+def _extract_business_card_fields(ocr_text: str) -> dict[str, Any]:
+    text = _normalize_business_card_text(ocr_text)
+    lines = text.splitlines()
+    lowered = [line.lower() for line in lines]
+
+    email_match = re.search(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", text, re.IGNORECASE)
+    phone_match = re.search(r"(?:\+?\d[\d\-\(\)\s]{7,}\d)", text)
+    website_match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text, re.IGNORECASE)
+
+    likely_name = lines[0] if lines else None
+    likely_company = None
+    likely_title = None
+    title_keywords = {
+        "ceo", "cto", "cfo", "coo", "founder", "manager", "director", "lead", "engineer",
+        "president", "partner", "owner", "consultant", "developer", "designer",
+    }
+    for idx, line in enumerate(lines[1:5], start=1):
+        tokens = set(token.strip(",. ").lower() for token in line.split())
+        if tokens & title_keywords and not likely_title:
+            likely_title = line
+            continue
+        if "@" not in line and not re.search(r"\d", line) and not likely_company:
+            likely_company = line
+        if likely_company and likely_title:
+            break
+        if idx > 4:
+            break
+
+    address_parts = []
+    for idx, line in enumerate(lines):
+        if re.search(r"\d{5}(?:-\d{4})?$", line) or any(
+            token in lowered[idx] for token in ["street", "st.", "avenue", "ave", "road", "rd.", "suite", "blvd", "drive"]
+        ):
+            address_parts.append(line)
+    address = ", ".join(address_parts) if address_parts else None
+
+    return {
+        "name": likely_name,
+        "title": likely_title,
+        "company": likely_company,
+        "email": email_match.group(0).strip() if email_match else None,
+        "phone": phone_match.group(0).strip() if phone_match else None,
+        "website": website_match.group(0).strip() if website_match else None,
+        "address": address,
+        "raw_lines": lines,
+    }
+
+
+def _coerce_public_url_candidate(value: Optional[str], field_name: str) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("www."):
+        raw = f"https://{raw}"
+    try:
+        return _validate_public_url(raw, field_name)
+    except HTTPException:
+        return None
+
+
+def _parse_scan_datetime_candidate(value: str) -> Optional[datetime]:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    candidate = re.sub(r"\s+", " ", candidate.replace(" at ", " ").strip())
+    formats = [
+        "%B %d, %Y %I:%M %p",
+        "%b %d, %Y %I:%M %p",
+        "%B %d %Y %I:%M %p",
+        "%b %d %Y %I:%M %p",
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%m/%d/%Y %I:%M %p",
+        "%m/%d/%Y",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ]
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(candidate, fmt)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_public_urls_from_text(text: str, max_urls: int = 10) -> list[str]:
+    if max_urls < 1:
+        return []
+    candidates = re.findall(r"(https?://[^\s<>'\"()]+|www\.[^\s<>'\"()]+)", text or "", flags=re.IGNORECASE)
+
+    def _canonicalize_url(url: str) -> str:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").strip().lower()
+        if host.startswith("www."):
+            host = host[4:]
+        path = parsed.path or ""
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+        if not path:
+            path = "/"
+        return parsed._replace(
+            netloc=host,
+            path=path,
+            fragment="",
+            params="",
+            query=parsed.query or "",
+        ).geturl()
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = _coerce_public_url_candidate(candidate, "source_url")
+        if not normalized:
+            continue
+        normalized = _canonicalize_url(normalized)
+        key = normalized.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(normalized)
+        if len(urls) >= max_urls:
+            break
+    return urls
+
+
+def _collect_event_links_from_html(source_url: str, html_text: str, max_links: int = 15) -> list[str]:
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    links: list[str] = []
+    seen: set[str] = set()
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href") or "").strip()
+        if not href:
+            continue
+        absolute = urljoin(source_url, href)
+        normalized = _coerce_public_url_candidate(absolute, "source_url")
+        if not normalized:
+            continue
+        label = (anchor.get_text(" ", strip=True) or "").lower()
+        href_lower = normalized.lower()
+        if (
+            "/event" not in href_lower
+            and "register" not in href_lower
+            and "ticket" not in href_lower
+            and "event" not in label
+            and "register" not in label
+            and "ticket" not in label
+            and "meetup" not in label
+        ):
+            continue
+        key = normalized.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        links.append(normalized)
+        if len(links) >= max_links:
+            break
+    return links
+
+
+def _extract_event_candidate_from_jsonld(source_url: str, html_text: str) -> dict[str, Any]:
+    soup = BeautifulSoup(html_text or "", "html.parser")
+    scripts = soup.find_all("script", attrs={"type": "application/ld+json"})
+    for script in scripts:
+        raw_json = (script.string or script.get_text(strip=True) or "").strip()
+        if not raw_json:
+            continue
+        try:
+            parsed = json.loads(raw_json)
+        except Exception:
+            continue
+        nodes: list[dict[str, Any]] = []
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("@graph"), list):
+                nodes.extend([item for item in parsed["@graph"] if isinstance(item, dict)])
+            else:
+                nodes.append(parsed)
+        elif isinstance(parsed, list):
+            nodes.extend([item for item in parsed if isinstance(item, dict)])
+        for node in nodes:
+            node_type = str(node.get("@type") or "").lower()
+            if "event" not in node_type:
+                continue
+            location_value = node.get("location")
+            location_name = None
+            if isinstance(location_value, dict):
+                location_name = str(location_value.get("name") or location_value.get("address") or "").strip() or None
+            elif isinstance(location_value, str):
+                location_name = location_value.strip() or None
+            return {
+                "title": str(node.get("name") or "").strip() or None,
+                "description": str(node.get("description") or "").strip() or None,
+                "starts_at": _coerce_calendar_datetime(node.get("startDate")),
+                "location": location_name,
+                "source_url": _coerce_public_url_candidate(node.get("url"), "source_url")
+                or _coerce_public_url_candidate(source_url, "source_url"),
+            }
+    return {}
+
+
+async def _enrich_event_scan_from_links(
+    *,
+    ocr_text: str,
+    seed_url: Optional[str],
+    max_fetches: int = 3,
+    max_links: int = 20,
+) -> dict[str, Any]:
+    source_candidates: list[str] = []
+    if seed_url:
+        normalized_seed = _coerce_public_url_candidate(seed_url, "source_url")
+        if normalized_seed:
+            source_candidates.append(normalized_seed)
+    source_candidates.extend(_extract_public_urls_from_text(ocr_text, max_urls=max_links))
+
+    deduped_candidates: list[str] = []
+    seen_candidates: set[str] = set()
+    for candidate in source_candidates:
+        key = candidate.strip().lower()
+        if key in seen_candidates:
+            continue
+        seen_candidates.add(key)
+        deduped_candidates.append(candidate)
+
+    visited_urls: list[str] = []
+    discovered_links: list[str] = []
+    event_candidate: dict[str, Any] = {}
+    discovered_link_keys: set[str] = set()
+    for candidate in deduped_candidates[:max_fetches]:
+        safe_url = _ensure_public_fetch_url(candidate, "event_link")
+        visited_urls.append(safe_url)
+        timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(
+                safe_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml",
+                    "User-Agent": "ArkavoOrgScanner/1.0",
+                },
+            )
+        if not response.is_success:
+            continue
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "html" not in content_type:
+            continue
+        html = response.text
+        resolved_url = _coerce_public_url_candidate(str(response.url), "source_url") or safe_url
+        candidate_from_jsonld = _extract_event_candidate_from_jsonld(resolved_url, html)
+        if candidate_from_jsonld and not event_candidate:
+            event_candidate = candidate_from_jsonld
+        for link in _collect_event_links_from_html(resolved_url, html, max_links=max_links):
+            key = link.lower()
+            if key in discovered_link_keys:
+                continue
+            discovered_link_keys.add(key)
+            discovered_links.append(link)
+        if len(discovered_links) >= max_links:
+            discovered_links = discovered_links[:max_links]
+            break
+
+    return {
+        "visited_urls": visited_urls,
+        "discovered_links": discovered_links[:max_links],
+        "event_candidate": event_candidate,
+    }
+
+
+def _extract_event_fields_from_text(ocr_text: str) -> dict[str, Any]:
+    events = _extract_events_from_text(ocr_text)
+    if events:
+        return events[0]
+
+    text = _normalize_business_card_text(ocr_text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return {"title": None, "starts_at": None, "location": None, "website": None, "description": None, "raw_lines": lines}
+
+
+def _extract_events_from_text(ocr_text: str) -> list[dict[str, Any]]:
+    text = _normalize_business_card_text(ocr_text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    extracted_urls = _extract_public_urls_from_text(text, max_urls=5)
+    month_hint = re.compile(
+        r"\b(jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\b",
+        re.IGNORECASE,
+    )
+    time_hint = re.compile(r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b", re.IGNORECASE)
+    date_hint = re.compile(r"\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}", re.IGNORECASE)
+    noisy_location_tokens = (
+        "we look forward",
+        "open houses",
+        "open house",
+        "transit administration",
+        "department of transportation",
+    )
+
+    title = None
+    for line in lines:
+        lowered = line.lower()
+        if "@" in lowered:
+            continue
+        if re.search(r"(https?://|www\.)", lowered):
+            continue
+        if re.search(r"\+?\d[\d\-\(\)\s]{7,}\d", line):
+            continue
+        if time_hint.search(lowered):
+            continue
+        if month_hint.search(lowered) or date_hint.search(lowered):
+            continue
+        title = line
+        break
+    title = title or lines[0]
+
+    def _is_date_line(value: str) -> bool:
+        normalized = value.strip().replace("–", "-").replace("—", "-")
+        return bool(month_hint.search(normalized) or date_hint.search(normalized))
+
+    def _parse_event_start_at(date_line: str, next_line: Optional[str]) -> Optional[datetime]:
+        date_candidate = date_line.strip().replace("–", "-").replace("—", "-").rstrip(":").strip()
+        starts_at = _parse_scan_datetime_candidate(date_candidate)
+        if starts_at:
+            return starts_at
+        if not next_line:
+            return None
+        next_normalized = next_line.strip().replace("–", "-").replace("—", "-")
+        time_match = re.search(r"\b\d{1,2}:\d{2}\s*(?:am|pm)\b", next_normalized, flags=re.IGNORECASE)
+        if not time_match:
+            return None
+        combined = f"{date_candidate} {time_match.group(0)}"
+        return _parse_scan_datetime_candidate(combined)
+
+    events: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if not _is_date_line(line):
+            idx += 1
+            continue
+        next_line = lines[idx + 1] if (idx + 1) < len(lines) else None
+        starts_at = _parse_event_start_at(line, next_line)
+        if not starts_at:
+            idx += 1
+            continue
+
+        location_start = idx + 1
+        if next_line and time_hint.search(next_line):
+            location_start = idx + 2
+        location_parts: list[str] = []
+        cursor = location_start
+        while cursor < len(lines):
+            candidate = lines[cursor].strip()
+            lowered = candidate.lower()
+            if _is_date_line(candidate):
+                break
+            if re.search(r"(https?://|www\.)", lowered):
+                break
+            if any(token in lowered for token in noisy_location_tokens):
+                break
+            if time_hint.search(lowered):
+                cursor += 1
+                continue
+            location_parts.append(candidate)
+            if len(location_parts) >= 2:
+                break
+            cursor += 1
+
+        location = " ".join(location_parts).strip() or None
+        event_payload = {
+            "title": title,
+            "starts_at": starts_at,
+            "location": location,
+            "website": extracted_urls[0] if extracted_urls else None,
+            "links": extracted_urls,
+            "description": None,
+            "raw_lines": lines,
+        }
+        events.append(event_payload)
+        idx = max(idx + 1, cursor)
+
+    if events:
+        return events
+
+    # Fallback to single-event heuristics for less structured OCR.
+    starts_at: Optional[datetime] = None
+    for line in lines:
+        normalized = line.strip().replace("–", "-").replace("—", "-")
+        if _is_date_line(normalized):
+            starts_at = _parse_scan_datetime_candidate(normalized.split(" - ", 1)[0].strip())
+            if starts_at:
+                break
+    location = None
+    location_markers = ("location", "venue", "address", "st.", "street", "ave", "avenue", "blvd", "road", "rd.")
+    for line in lines:
+        lowered = line.lower()
+        if any(marker in lowered for marker in location_markers):
+            location = line.split(":", 1)[-1].strip() if ":" in line else line
+            break
+    description_lines = [line for line in lines[1:5] if line != location]
+    description = "\n".join(description_lines).strip() or None
+    if description and len(description) > 2000:
+        description = description[:2000]
+    return [
+        {
+            "title": title,
+            "starts_at": starts_at,
+            "location": location,
+            "website": extracted_urls[0] if extracted_urls else None,
+            "links": extracted_urls,
+            "description": description,
+            "raw_lines": lines,
+        }
+    ]
+
+
+def _extract_organization_fields_from_text(ocr_text: str) -> dict[str, Any]:
+    text = _normalize_business_card_text(ocr_text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return {"name": None, "website": None, "description": None, "raw_lines": []}
+
+    website_match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text, re.IGNORECASE)
+    name = None
+    org_tokens = ("inc", "llc", "ltd", "foundation", "association", "collective", "organization", "org", "corp", "company")
+    for line in lines:
+        lowered = line.lower()
+        if re.search(r"(https?://|www\.)", lowered):
+            continue
+        if "@" in lowered:
+            continue
+        if any(token in lowered for token in org_tokens):
+            name = line
+            break
+    if not name:
+        name = lines[0]
+
+    description_lines = [line for line in lines[1:5] if "@" not in line and not re.search(r"(https?://|www\.)", line, re.IGNORECASE)]
+    description = "\n".join(description_lines).strip() or None
+    if description and len(description) > 2000:
+        description = description[:2000]
+
+    return {
+        "name": name,
+        "website": website_match.group(0).strip() if website_match else None,
+        "description": description,
+        "raw_lines": lines,
+    }
+
+
+def _derive_org_name_from_website(website: Optional[str]) -> Optional[str]:
+    raw = str(website or "").strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("www."):
+        raw = f"https://{raw}"
+    try:
+        host = (urlparse(raw).hostname or "").strip().lower()
+    except Exception:
+        return None
+    if not host:
+        return None
+    if host.startswith("www."):
+        host = host[4:]
+    label = host.split(".", 1)[0].strip()
+    if not label:
+        return None
+    label = re.sub(r"[-_]+", " ", label)
+    label = re.sub(r"\s+", " ", label).strip()
+    if not label:
+        return None
+    return label.title()
+
+
+def _derive_org_payload_for_person_scan(
+    extracted_person: dict[str, Any],
+    extracted_org: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    person_name = str(extracted_person.get("name") or "").strip()
+    person_name_key = re.sub(r"\s+", " ", person_name).strip().lower()
+
+    candidate_names: list[str] = []
+    for candidate in [
+        extracted_person.get("company"),
+        extracted_org.get("name"),
+    ]:
+        value = str(candidate or "").strip()
+        if not value:
+            continue
+        value_key = re.sub(r"\s+", " ", value).strip().lower()
+        if person_name_key and value_key == person_name_key:
+            continue
+        if value not in candidate_names:
+            candidate_names.append(value)
+
+    website = (
+        _coerce_public_url_candidate(extracted_org.get("website"), "source_url")
+        or _coerce_public_url_candidate(extracted_person.get("website"), "source_url")
+    )
+    chosen_name = candidate_names[0] if candidate_names else None
+    if not chosen_name and website:
+        chosen_name = _derive_org_name_from_website(website)
+    if not chosen_name:
+        return None
+    return {
+        "name": chosen_name,
+        "website": website,
+        "description": extracted_org.get("description"),
+        "raw_lines": extracted_org.get("raw_lines") or extracted_person.get("raw_lines") or [],
+    }
+
+
+def _normalize_scan_kind(value: Optional[str]) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"person", "organization", "event", "auto"}:
+        return normalized
+    return "auto"
+
+
+def _score_scan_kind_candidates(
+    ocr_text: str,
+    extracted_person: dict[str, Any],
+    extracted_org: dict[str, Any],
+    extracted_event: dict[str, Any],
+) -> dict[str, float]:
+    text = _normalize_business_card_text(ocr_text).lower()
+
+    person_score = 0.0
+    if extracted_person.get("email"):
+        person_score += 0.65
+    if extracted_person.get("phone"):
+        person_score += 0.2
+    if extracted_person.get("name"):
+        person_score += 0.1
+    if extracted_person.get("title") or extracted_person.get("company"):
+        person_score += 0.05
+
+    organization_score = 0.0
+    if extracted_org.get("name"):
+        organization_score += 0.55
+    if extracted_org.get("website"):
+        organization_score += 0.25
+    if extracted_org.get("description"):
+        organization_score += 0.1
+    if any(token in text for token in ["org", "organization", "inc", "llc", "nonprofit", "foundation"]):
+        organization_score += 0.1
+
+    event_score = 0.0
+    if extracted_event.get("starts_at"):
+        event_score += 0.55
+    if extracted_event.get("website"):
+        event_score += 0.2
+    if extracted_event.get("location"):
+        event_score += 0.15
+    if any(token in text for token in ["event", "meetup", "conference", "workshop", "summit", "webinar"]):
+        event_score += 0.1
+
+    return {
+        "person": max(0.0, min(1.0, person_score)),
+        "organization": max(0.0, min(1.0, organization_score)),
+        "event": max(0.0, min(1.0, event_score)),
+    }
+
+
+def _detect_scan_kind(ocr_text: str, extracted_person: dict[str, Any], extracted_org: dict[str, Any], extracted_event: dict[str, Any]) -> str:
+    scores = _score_scan_kind_candidates(
+        ocr_text=ocr_text,
+        extracted_person=extracted_person,
+        extracted_org=extracted_org,
+        extracted_event=extracted_event,
+    )
+    sorted_scores = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return sorted_scores[0][0] if sorted_scores else "person"
+
+
+def _create_or_find_organization_from_scan(
+    session: Session,
+    *,
+    actor_user_id: str,
+    extracted_org: dict[str, Any],
+    default_image_url: Optional[str] = None,
+) -> Organization:
+    name = str(extracted_org.get("name") or "").strip() or "Organization"
+    source_url = _coerce_public_url_candidate(extracted_org.get("website"), "source_url")
+    if source_url:
+        existing = _find_org_by_source_url(session, source_url)
+        if existing:
+            if default_image_url and not (existing.image_url or "").strip():
+                existing.image_url = default_image_url
+            return existing
+    existing_by_name = session.query(Organization).filter(func.lower(Organization.name) == name.lower()).first()
+    if existing_by_name:
+        if source_url:
+            _add_org_source_url(existing_by_name, source_url)
+        if default_image_url and not (existing_by_name.image_url or "").strip():
+            existing_by_name.image_url = default_image_url
+        return existing_by_name
+    normalized_slug = _slugify(name)
+    if normalized_slug:
+        existing_by_slug = session.query(Organization).filter(Organization.slug == normalized_slug).first()
+        if existing_by_slug:
+            if source_url:
+                _add_org_source_url(existing_by_slug, source_url)
+            if default_image_url and not (existing_by_slug.image_url or "").strip():
+                existing_by_slug.image_url = default_image_url
+            return existing_by_slug
+
+    org = Organization(
+        id=uuid.uuid4(),
+        name=name[:255],
+        slug=_ensure_unique_org_slug(session, name),
+        description=(str(extracted_org.get("description") or "").strip() or None),
+        source_url=source_url,
+        source_urls=[source_url] if source_url else [],
+        image_url=default_image_url,
+        tags=["source:scan"],
+        seeded_from_events=False,
+        claimed_by_user_id=None,
+        created_by_user_id=actor_user_id,
+    )
+    session.add(org)
+    return org
+
+
+def _create_event_from_scan(
+    session: Session,
+    *,
+    actor_user_id: str,
+    extracted_event: dict[str, Any],
+    default_image_url: Optional[str] = None,
+) -> NetworkEvent:
+    title = str(extracted_event.get("title") or "").strip() or "Untitled Event"
+    starts_at = extracted_event.get("starts_at")
+    location = str(extracted_event.get("location") or "").strip() or None
+    source_url = _coerce_public_url_candidate(extracted_event.get("website"), "source_url")
+    if source_url:
+        existing = session.query(NetworkEvent).filter(NetworkEvent.source_url == source_url).first()
+        if existing:
+            if default_image_url and not (existing.image_url or "").strip():
+                existing.image_url = default_image_url
+            return existing
+    duplicate_query = session.query(NetworkEvent).filter(func.lower(NetworkEvent.title) == title.lower())
+    if starts_at is not None:
+        duplicate_query = duplicate_query.filter(NetworkEvent.starts_at == starts_at)
+    if location:
+        duplicate_query = duplicate_query.filter(func.lower(NetworkEvent.location) == location.lower())
+    existing_structured = duplicate_query.order_by(NetworkEvent.created_at.desc()).first()
+    if existing_structured:
+        if default_image_url and not (existing_structured.image_url or "").strip():
+            existing_structured.image_url = default_image_url
+        return existing_structured
+
+    event = NetworkEvent(
+        id=uuid.uuid4(),
+        title=title[:255],
+        slug=_ensure_unique_event_slug(session, title),
+        description=(str(extracted_event.get("description") or "").strip() or None),
+        starts_at=starts_at,
+        ends_at=None,
+        location=location,
+        source_url=source_url,
+        image_url=default_image_url,
+        tags=["source:scan"],
+        host_type=EventHostType.UNCLAIMED.value,
+        host_user_id=None,
+        host_org_id=None,
+        claimed_by_user_id=None,
+        created_by_user_id=actor_user_id,
+        seeded_from_events=False,
+    )
+    session.add(event)
+    return event
+
+
+async def _ocr_business_card_with_openai(
+    image_bytes: bytes,
+    content_type: str,
+    *,
+    audit_hook: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> str:
+    if not ORG_OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="ORG_OPENAI_API_KEY is not configured")
+
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    prompt = (
+        "You are extracting text from a business card image. Return only the visible text, preserving line breaks. "
+        "Do not add commentary."
+    )
+    payload = {
+        "model": ORG_BUSINESS_CARD_OCR_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:{content_type};base64,{image_b64}"}},
+                ],
+            }
+        ],
+        "temperature": 0,
+    }
+    headers = {
+        "Authorization": f"Bearer {ORG_OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    timeout = httpx.Timeout(connect=15.0, read=90.0, write=30.0, pool=30.0)
+    if audit_hook:
+        audit_hook(
+            "scan.ai.ocr.requested",
+            {
+                "provider": "openai",
+                "model": ORG_BUSINESS_CARD_OCR_MODEL,
+                "image_content_type": content_type,
+                "image_size_bytes": len(image_bytes),
+            },
+        )
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            f"{ORG_OPENAI_API_BASE_URL}/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+    if not response.is_success:
+        if audit_hook:
+            audit_hook(
+                "scan.ai.ocr.failed",
+                {
+                    "provider": "openai",
+                    "model": ORG_BUSINESS_CARD_OCR_MODEL,
+                    "status_code": response.status_code,
+                },
+            )
+        detail = response.text.strip() or f"OCR request failed ({response.status_code})"
+        raise HTTPException(status_code=502, detail=detail)
+
+    body = response.json()
+    choices = body.get("choices") or []
+    if not choices:
+        raise HTTPException(status_code=502, detail="OCR response missing choices")
+    message = (choices[0] or {}).get("message") or {}
+    extracted = _extract_text_content_from_openai_message_content(message.get("content"))
+    extracted = _normalize_business_card_text(extracted)
+    if not extracted:
+        raise HTTPException(status_code=422, detail="Unable to extract text from business card image")
+    if audit_hook:
+        audit_hook(
+            "scan.ai.ocr.completed",
+            {
+                "provider": "openai",
+                "model": ORG_BUSINESS_CARD_OCR_MODEL,
+                "status_code": response.status_code,
+                "output_chars": len(extracted),
+            },
+        )
+    return extracted
+
+
+def _extract_text_content_from_openai_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        extracted_parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+                extracted_parts.append(str(item["text"]))
+        return "\n".join(extracted_parts)
+    return ""
+
+
+async def _summarize_scan_targets_with_openai(
+    *,
+    ocr_text: str,
+    created_targets: List[Dict[str, Optional[str]]],
+    audit_hook: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> List[Dict[str, Optional[str]]]:
+    if not created_targets:
+        return created_targets
+    if not ORG_SCAN_AI_SUMMARY_ENABLED or not ORG_OPENAI_API_KEY:
+        return created_targets
+
+    summarized_targets: List[Dict[str, Optional[str]]] = [dict(item) for item in created_targets]
+    summarized_targets_payload = [
+        {
+            "type": str(item.get("type") or "").strip() or "resource",
+            "id": str(item.get("id") or "").strip() or None,
+            "slug": str(item.get("slug") or "").strip() or None,
+            "name": str(item.get("name") or "").strip() or None,
+        }
+        for item in summarized_targets
+    ]
+    prompt_payload = {
+        "ocr_text": (ocr_text or "")[:12000],
+        "targets": summarized_targets_payload,
+    }
+    prompt = (
+        "You summarize records created from OCR. For each target in `targets`, generate a concise factual "
+        "summary (max 140 chars) using only OCR content. Do not invent. "
+        "Return strict JSON: {\"items\":[{\"index\":0,\"summary\":\"...\"}, ...]}"
+    )
+    request_payload = {
+        "model": ORG_BUSINESS_CARD_OCR_MODEL,
+        "messages": [
+            {"role": "system", "content": "Return valid JSON only."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": json.dumps(prompt_payload, ensure_ascii=True)},
+                ],
+            },
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {
+        "Authorization": f"Bearer {ORG_OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    timeout = httpx.Timeout(connect=15.0, read=60.0, write=30.0, pool=30.0)
+    if audit_hook:
+        audit_hook(
+            "scan.ai.summary.requested",
+            {
+                "provider": "openai",
+                "model": ORG_BUSINESS_CARD_OCR_MODEL,
+                "targets_count": len(summarized_targets),
+            },
+        )
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            f"{ORG_OPENAI_API_BASE_URL}/chat/completions",
+            json=request_payload,
+            headers=headers,
+        )
+    if not response.is_success:
+        if audit_hook:
+            audit_hook(
+                "scan.ai.summary.failed",
+                {
+                    "provider": "openai",
+                    "model": ORG_BUSINESS_CARD_OCR_MODEL,
+                    "status_code": response.status_code,
+                },
+            )
+        return summarized_targets
+
+    body = response.json()
+    choices = body.get("choices") or []
+    if not choices:
+        return summarized_targets
+    message = (choices[0] or {}).get("message") or {}
+    content_text = _extract_text_content_from_openai_message_content(message.get("content")).strip()
+    if not content_text:
+        return summarized_targets
+
+    parsed: dict[str, Any] = {}
+    try:
+        parsed = json.loads(content_text)
+    except Exception:
+        if audit_hook:
+            audit_hook(
+                "scan.ai.summary.failed",
+                {
+                    "provider": "openai",
+                    "model": ORG_BUSINESS_CARD_OCR_MODEL,
+                    "reason": "invalid_json",
+                },
+            )
+        return summarized_targets
+
+    items = parsed.get("items")
+    summaries_applied = 0
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("index"))
+            except Exception:
+                continue
+            if index < 0 or index >= len(summarized_targets):
+                continue
+            summary = re.sub(r"\s+", " ", str(item.get("summary") or "").strip())
+            if not summary:
+                continue
+            summarized_targets[index]["summary"] = summary[:140]
+            summaries_applied += 1
+
+    if audit_hook:
+        audit_hook(
+            "scan.ai.summary.completed",
+            {
+                "provider": "openai",
+                "model": ORG_BUSINESS_CARD_OCR_MODEL,
+                "targets_count": len(summarized_targets),
+                "summaries_applied": summaries_applied,
+            },
+        )
+    return summarized_targets
+
+
+async def _extract_business_card_text(
+    image_bytes: bytes,
+    content_type: str,
+    *,
+    audit_hook: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> tuple[str, str]:
+    provider = ORG_BUSINESS_CARD_OCR_PROVIDER
+    if provider == "openai":
+        return await _ocr_business_card_with_openai(
+            image_bytes=image_bytes,
+            content_type=content_type,
+            audit_hook=audit_hook,
+        ), provider
+    raise HTTPException(status_code=503, detail=f"Unsupported ORG_BUSINESS_CARD_OCR_PROVIDER '{provider}'")
+
+
+async def _create_or_find_pidp_user_from_business_card(email: str, full_name: Optional[str]) -> dict[str, Any]:
+    generated_password = secrets.token_urlsafe(24)
+    payload = {
+        "email": email,
+        "password": generated_password,
+        "full_name": full_name or None,
+    }
+    timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            f"{PIDP_BASE_URL}/auth/register",
+            json=payload,
+        )
+    if response.status_code in {200, 201}:
+        data = response.json()
+        return {
+            "created": True,
+            "pidp_user_id": str(data.get("id") or ""),
+            "generated_password": generated_password,
+        }
+    if response.status_code == 409:
+        return {
+            "created": False,
+            "pidp_user_id": None,
+            "generated_password": None,
+        }
+    detail = response.text.strip() or f"Unable to create PIdP user ({response.status_code})"
+    raise HTTPException(status_code=502, detail=detail)
+
+
+def _send_business_card_added_email(
+    recipient_email: str,
+    recipient_name: Optional[str],
+    submitted_by_name: Optional[str],
+) -> None:
+    if not ORG_SMTP_HOST:
+        raise RuntimeError("SMTP is not configured (ORG_SMTP_HOST missing)")
+
+    portal_url = ORG_PORTAL_BASE_URL or "https://portal.arkavo.org"
+    display_name = (recipient_name or recipient_email).strip()
+    submitter = (submitted_by_name or "an org admin").strip()
+
+    msg = EmailMessage()
+    msg["Subject"] = "You were added to Arkavo OrgPortal"
+    msg["From"] = ORG_SMTP_FROM
+    msg["To"] = recipient_email
+    msg.set_content(
+        (
+            f"Hi {display_name},\n\n"
+            f"{submitter} submitted your business card and added you to Arkavo OrgPortal.\n"
+            f"You can sign in or register with this email at:\n{portal_url}\n\n"
+            "If this was unexpected, please ignore this email.\n"
+        )
+    )
+
+    with smtplib.SMTP(ORG_SMTP_HOST, ORG_SMTP_PORT, timeout=30) as smtp:
+        if ORG_SMTP_STARTTLS:
+            smtp.starttls()
+        if ORG_SMTP_USERNAME:
+            smtp.login(ORG_SMTP_USERNAME, ORG_SMTP_PASSWORD)
+        smtp.send_message(msg)
+
+
+def _record_business_card_email_outcome(submission_id: uuid.UUID, sent: bool, error_message: Optional[str]) -> None:
+    session = db.SessionLocal()
+    try:
+        record = session.query(BusinessCardSubmission).filter(BusinessCardSubmission.id == submission_id).first()
+        if not record:
+            return
+        record.notification_email_sent = bool(sent)
+        record.notification_error = error_message
+        record.updated_at = datetime.now(timezone.utc)
+        session.commit()
+    except Exception:
+        session.rollback()
+    finally:
+        session.close()
+
+
+def _send_business_card_email_task(
+    submission_id: uuid.UUID,
+    recipient_email: str,
+    recipient_name: Optional[str],
+    submitted_by_name: Optional[str],
+) -> None:
+    try:
+        _send_business_card_added_email(
+            recipient_email=recipient_email,
+            recipient_name=recipient_name,
+            submitted_by_name=submitted_by_name,
+        )
+        _record_business_card_email_outcome(submission_id=submission_id, sent=True, error_message=None)
+    except Exception as exc:
+        _record_business_card_email_outcome(submission_id=submission_id, sent=False, error_message=str(exc))
+
+
+def _matrix_localpart_for_pidp_user(pidp_user_id: str) -> str:
+    base = re.sub(r"[^a-z0-9._=\-/]+", "-", (pidp_user_id or "").strip().lower()).strip("-")
+    if not base:
+        base = hashlib.sha256(pidp_user_id.encode("utf-8")).hexdigest()[:24]
+    localpart = f"org-{base}"
+    return localpart[:254]
+
+
+def _matrix_user_id_for_pidp_user(pidp_user_id: str) -> str:
+    localpart = _matrix_localpart_for_pidp_user(pidp_user_id)
+    return f"@{localpart}:{ORG_MATRIX_SERVER_NAME}"
+
+
+def _matrix_bootstrap_password(pidp_user_id: str) -> str:
+    if not ORG_MATRIX_PASSWORD_SECRET:
+        raise HTTPException(status_code=503, detail="Matrix bootstrap secret is not configured")
+    digest = hmac.new(
+        ORG_MATRIX_PASSWORD_SECRET.encode("utf-8"),
+        pidp_user_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"orgp-{digest}"
+
+
+def _matrix_admin_headers() -> dict[str, str]:
+    if not ORG_MATRIX_ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="Matrix bootstrap admin token is not configured")
+    return {"Authorization": f"Bearer {ORG_MATRIX_ADMIN_TOKEN}"}
+
+
+def _matrix_org_room_alias_candidates(org_slug: str) -> list[str]:
+    normalized_slug = _slugify(org_slug)
+    # Keep alias derivation deterministic and backward-compatible with likely variants.
+    localparts = [
+        f"org-{normalized_slug}",
+        normalized_slug,
+        f"org-{normalized_slug}-chat",
+    ]
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for localpart in localparts:
+        alias = f"#{localpart}:{ORG_MATRIX_SERVER_NAME}"
+        if alias in seen:
+            continue
+        seen.add(alias)
+        aliases.append(alias)
+    return aliases
+
+
+def _matrix_org_room_alias_localpart(org_slug: str) -> str:
+    normalized_slug = _slugify(org_slug)
+    return f"org-{normalized_slug}"
+
+
+async def _matrix_room_id_from_alias(
+    client: httpx.AsyncClient,
+    room_alias: str,
+) -> Optional[str]:
+    encoded_alias = quote(room_alias, safe="")
+    response = await client.get(f"{ORG_MATRIX_HOMESERVER_URL}/_matrix/client/v3/directory/room/{encoded_alias}")
+    if response.status_code == 404:
+        return None
+    if not response.is_success:
+        return None
+    payload = response.json() if response.content else {}
+    room_id = str(payload.get("room_id") or "").strip()
+    return room_id or None
+
+
+async def _resolve_org_public_chat_room(
+    client: httpx.AsyncClient,
+    org_slug: str,
+) -> tuple[Optional[str], Optional[str]]:
+    for alias in _matrix_org_room_alias_candidates(org_slug):
+        room_id = await _matrix_room_id_from_alias(client, alias)
+        if room_id:
+            return room_id, alias
+    return None, None
+
+
+async def _matrix_create_public_org_room(
+    client: httpx.AsyncClient,
+    org_name: str,
+    org_slug: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    alias_localpart = _matrix_org_room_alias_localpart(org_slug)
+    primary_alias = f"#{alias_localpart}:{ORG_MATRIX_SERVER_NAME}"
+    payload = {
+        "visibility": "public",
+        "preset": "public_chat",
+        "name": (org_name or org_slug).strip()[:255] or org_slug,
+        "topic": f"Public discussion space for {org_name or org_slug}",
+        "room_alias_name": alias_localpart,
+    }
+    response = await client.post(
+        f"{ORG_MATRIX_HOMESERVER_URL}/_matrix/client/v3/createRoom",
+        headers=_matrix_admin_headers(),
+        json=payload,
+    )
+    if response.is_success:
+        body = response.json() if response.content else {}
+        room_id = str(body.get("room_id") or "").strip()
+        if room_id:
+            logger.info("Provisioned Matrix public org room slug=%s room_id=%s", org_slug, room_id)
+            return room_id, primary_alias, payload["name"]
+        return None, None, None
+
+    error_text = (response.text or "").strip().lower()
+    # Race-safe behavior: if alias already exists, resolve it and continue.
+    if response.status_code in {400, 409} and (
+        "room alias" in error_text or "in use" in error_text or "m_room_in_use" in error_text
+    ):
+        existing_room_id = await _matrix_room_id_from_alias(client, primary_alias)
+        if existing_room_id:
+            logger.info("Reused existing Matrix public org room slug=%s room_id=%s", org_slug, existing_room_id)
+            return existing_room_id, primary_alias, payload["name"]
+    logger.warning(
+        "Failed to provision Matrix public org room slug=%s status=%s body=%s",
+        org_slug,
+        response.status_code,
+        (response.text or "").strip()[:400],
+    )
+    return None, None, None
+
+
+async def _matrix_find_public_room_for_org(
+    client: httpx.AsyncClient,
+    org_name: str,
+    org_slug: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    slug = _slugify(org_slug)
+    name = (org_name or "").strip().lower()
+    search_terms = [name, slug]
+    for term in search_terms:
+        if not term:
+            continue
+        response = await client.post(
+            f"{ORG_MATRIX_HOMESERVER_URL}/_matrix/client/v3/publicRooms",
+            json={
+                "limit": 50,
+                "filter": {"generic_search_term": term},
+            },
+        )
+        if not response.is_success:
+            continue
+        payload = response.json() if response.content else {}
+        chunk = payload.get("chunk") if isinstance(payload, dict) else None
+        if not isinstance(chunk, list):
+            continue
+        for room in chunk:
+            if not isinstance(room, dict):
+                continue
+            room_id = str(room.get("room_id") or "").strip()
+            canonical_alias = str(room.get("canonical_alias") or "").strip() or None
+            room_name = str(room.get("name") or "").strip() or None
+            if not room_id:
+                continue
+            alias_text = (canonical_alias or "").lower()
+            room_name_text = (room_name or "").lower()
+            if slug and (slug in alias_text or slug in room_name_text):
+                return room_id, canonical_alias, room_name
+            if name and name in room_name_text:
+                return room_id, canonical_alias, room_name
+    return None, None, None
+
+
+async def _matrix_upsert_user(
+    client: httpx.AsyncClient,
+    matrix_user_id: str,
+    password: str,
+    display_name: str,
+) -> None:
+    encoded_user_id = quote(matrix_user_id, safe="")
+    resp = await client.put(
+        f"{ORG_MATRIX_HOMESERVER_URL}/_synapse/admin/v2/users/{encoded_user_id}",
+        headers=_matrix_admin_headers(),
+        json={
+            "password": password,
+            "displayname": (display_name or matrix_user_id)[:255],
+            "admin": False,
+            "deactivated": False,
+            "logout_devices": False,
+        },
+    )
+    if not resp.is_success:
+        detail = resp.text.strip() or f"Matrix admin user upsert failed ({resp.status_code})"
+        raise HTTPException(status_code=502, detail=detail)
+
+
+async def _matrix_login_password(
+    client: httpx.AsyncClient,
+    matrix_user_id: str,
+    password: str,
+) -> MatrixBootstrapSessionResponse:
+    login_resp = await client.post(
+        f"{ORG_MATRIX_HOMESERVER_URL}/_matrix/client/v3/login",
+        json={
+            "type": "m.login.password",
+            "identifier": {
+                "type": "m.id.user",
+                "user": matrix_user_id,
+            },
+            "password": password,
+        },
+    )
+    if not login_resp.is_success:
+        detail = login_resp.text.strip() or f"Matrix login failed ({login_resp.status_code})"
+        raise HTTPException(status_code=502, detail=detail)
+    payload = login_resp.json()
+    access_token = str(payload.get("access_token") or "").strip()
+    user_id = str(payload.get("user_id") or "").strip()
+    if not access_token or not user_id:
+        raise HTTPException(status_code=502, detail="Matrix login response missing access_token or user_id")
+    return MatrixBootstrapSessionResponse(
+        access_token=access_token,
+        user_id=user_id,
+        device_id=payload.get("device_id"),
+        homeserver_url=ORG_MATRIX_HOMESERVER_URL,
+    )
+
+
+async def _bootstrap_matrix_session_for_current_user(current_user: dict) -> MatrixBootstrapSessionResponse:
+    _require_authenticated_user(current_user)
+    pidp_user_id = _actor_user_id(current_user)
+    if not pidp_user_id:
+        raise HTTPException(status_code=401, detail="Authenticated user id is required")
+    matrix_user_id = _matrix_user_id_for_pidp_user(pidp_user_id)
+    matrix_password = _matrix_bootstrap_password(pidp_user_id)
+    display_name = str(current_user.get("name") or current_user.get("email") or matrix_user_id).strip()
+
+    timeout = httpx.Timeout(connect=10.0, read=15.0, write=15.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # Upsert guarantees the account exists and has the expected deterministic bootstrap password.
+        await _matrix_upsert_user(
+            client=client,
+            matrix_user_id=matrix_user_id,
+            password=matrix_password,
+            display_name=display_name,
+        )
+        return await _matrix_login_password(
+            client=client,
+            matrix_user_id=matrix_user_id,
+            password=matrix_password,
+        )
+
+
 def _slugify(value: str) -> str:
-    value = value.strip().lower()
-    value = re.sub(r"[^a-z0-9]+", "-", value)
-    value = re.sub(r"-{2,}", "-", value).strip("-")
-    return value or "profile"
+    return slugify(value)
 
 
 def _ensure_unique_org_slug(session: Session, preferred: str) -> str:
@@ -1818,6 +4089,22 @@ def _ensure_unique_event_slug(session: Session, preferred: str) -> str:
         session.query(NetworkEvent).filter(NetworkEvent.slug == candidate).first()
         or any(
             isinstance(obj, NetworkEvent) and getattr(obj, "slug", None) == candidate
+            for obj in session.new
+        )
+    ):
+        candidate = f"{base}-{counter}"
+        counter += 1
+    return candidate
+
+
+def _ensure_unique_team_slug(session: Session, preferred: str) -> str:
+    base = _slugify(preferred)
+    candidate = base
+    counter = 2
+    while (
+        session.query(Team).filter(Team.slug == candidate).first()
+        or any(
+            isinstance(obj, Team) and getattr(obj, "slug", None) == candidate
             for obj in session.new
         )
     ):
@@ -1953,22 +4240,39 @@ def _map_governance_motion(motion: GovernanceMotion) -> GovernanceMotionResponse
         discussion_deadline=motion.discussion_deadline,
         voting_deadline=motion.voting_deadline,
         quorum_required=motion.quorum_required,
+        is_dissolution=(motion.type == GovernanceMotionType.DISSOLUTION.value),
         created_at=motion.created_at,
         updated_at=motion.updated_at,
     )
+
+
+def _dissolution_required_yea(participating_voters: int) -> int:
+    if participating_voters <= 0:
+        return 0
+    return (3 * participating_voters + 3) // 4
 
 
 def _governance_vote_result(motion: GovernanceMotion) -> Dict[str, Any]:
     yea = sum(1 for v in motion.votes if v.choice == GovernanceVoteChoice.YEA.value)
     nay = sum(1 for v in motion.votes if v.choice == GovernanceVoteChoice.NAY.value)
     abstain = sum(1 for v in motion.votes if v.choice == GovernanceVoteChoice.ABSTAIN.value)
-    quorum_met = len(motion.votes) >= int(motion.quorum_required or 0)
+    participating_voters = yea + nay + abstain
+    quorum_met = participating_voters >= int(motion.quorum_required or 0)
+    threshold_rule = "simple_majority"
+    required_yea = nay + 1
     passed = quorum_met and yea > nay
+    if motion.type == GovernanceMotionType.DISSOLUTION.value:
+        threshold_rule = "three_fourths_majority_of_participating_voters"
+        required_yea = _dissolution_required_yea(participating_voters)
+        passed = quorum_met and yea >= required_yea
     return {
         "yea": yea,
         "nay": nay,
         "abstain": abstain,
         "total_eligible": int(motion.quorum_required or 0),
+        "participating_voters": participating_voters,
+        "threshold_rule": threshold_rule,
+        "required_yea": required_yea,
         "quorum_met": quorum_met,
         "passed": passed,
     }
@@ -1980,12 +4284,48 @@ def _governance_reaction_counts(motion: GovernanceMotion) -> GovernanceVoteCount
     return GovernanceVoteCountsResponse(up=up, down=down, score=up - down)
 
 
+def _get_dissolution_plan(
+    session: Session,
+    motion_id: uuid.UUID,
+) -> Optional[GovernanceDissolutionPlan]:
+    return (
+        session.query(GovernanceDissolutionPlan)
+        .filter(GovernanceDissolutionPlan.motion_id == motion_id)
+        .first()
+    )
+
+
+def _validate_dissolution_payload(payload: GovernanceMotionCreate) -> None:
+    if payload.type != GovernanceMotionType.DISSOLUTION.value:
+        return
+    if payload.parent_motion_id:
+        raise HTTPException(status_code=422, detail="Dissolution motions cannot be amendments")
+    asset_disposition = (payload.dissolution_asset_disposition or "").strip()
+    recipient_name = (payload.dissolution_asset_recipient_name or "").strip()
+    recipient_type = (payload.dissolution_asset_recipient_type or "").strip()
+    if not asset_disposition:
+        raise HTTPException(
+            status_code=422,
+            detail="dissolution_asset_disposition is required for dissolution motions",
+        )
+    if not recipient_name:
+        raise HTTPException(
+            status_code=422,
+            detail="dissolution_asset_recipient_name is required for dissolution motions",
+        )
+    if recipient_type not in {"non_profit", "other_legal_entity"}:
+        raise HTTPException(
+            status_code=422,
+            detail="dissolution_asset_recipient_type must be non_profit or other_legal_entity",
+        )
+
+
 def _can_manage_governance_motion(
     motion: GovernanceMotion,
     current_user: dict,
     session: Session,
 ) -> bool:
-    if current_user.get("is_admin"):
+    if _is_sysadmin(current_user):
         return True
     user_id = _actor_user_id(current_user)
     if not user_id:
@@ -2017,8 +4357,7 @@ def _ensure_governance_transition(motion: GovernanceMotion, target_status: str) 
         },
         GovernanceMotionStatus.TABLED.value: {GovernanceMotionStatus.DISCUSSION.value},
     }
-    allowed = transitions.get(motion.status, set())
-    if target_status not in allowed:
+    if not is_transition_allowed(motion.status, target_status, transitions):
         raise HTTPException(
             status_code=400,
             detail=f"Invalid status transition from {motion.status} to {target_status}",
@@ -2044,6 +4383,11 @@ def _map_network_event(event: NetworkEvent, current_user: Optional[dict], sessio
         host_org = session.query(Organization).filter(Organization.id == event.host_org_id).first()
         if host_org:
             host_org_name = host_org.name
+    source_url = (event.source_url or "").strip().lower()
+    represented_in_codecollective_source = bool(
+        event.seeded_from_events
+        or "codecollective.us" in source_url
+    )
 
     return NetworkEventResponse(
         id=event.id,
@@ -2063,6 +4407,7 @@ def _map_network_event(event: NetworkEvent, current_user: Optional[dict], sessio
         claimed_by_user_id=event.claimed_by_user_id,
         created_by_user_id=event.created_by_user_id,
         seeded_from_events=bool(event.seeded_from_events),
+        represented_in_codecollective_source=represented_in_codecollective_source,
         is_unclaimed=event.claimed_by_user_id is None,
         my_host_role=my_host_role,
         created_at=event.created_at,
@@ -2093,7 +4438,7 @@ def _resolve_event_host_binding(
         target_user_id = normalized_user_id or user_id
         if not target_user_id:
             raise HTTPException(status_code=401, detail="Authentication required for individual host")
-        if target_user_id != user_id and not current_user.get("is_admin"):
+        if target_user_id != user_id and not _is_sysadmin(current_user):
             raise HTTPException(status_code=403, detail="Cannot assign event to a different user")
         return EventHostType.INDIVIDUAL.value, target_user_id, None
 
@@ -2113,12 +4458,7 @@ def _resolve_event_host_binding(
 
 
 def _extract_bearer_token(authorization: Optional[str]) -> str:
-    if not authorization:
-        return ""
-    value = authorization.strip()
-    if not value.lower().startswith("bearer "):
-        return ""
-    return value.split(" ", 1)[1].strip()
+    return extract_bearer_token(authorization)
 
 
 def _require_ingest_auth(request: Request) -> None:
@@ -2134,26 +4474,11 @@ def _require_ingest_auth(request: Request) -> None:
 
 
 def _normalize_ingest_url(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    cleaned = value.strip()
-    if not cleaned:
-        return None
-    if not re.match(r"^https?://", cleaned, flags=re.IGNORECASE):
-        return None
-    return cleaned
+    return normalize_ingest_url(value)
 
 
 def _normalize_org_source_urls(values: Optional[List[str]]) -> List[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for raw in values or []:
-        url = _normalize_ingest_url(raw)
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        normalized.append(url)
-    return normalized
+    return normalize_org_source_urls(values)
 
 
 def _org_source_urls(org: Organization) -> List[str]:
@@ -2193,26 +4518,11 @@ def _find_org_by_source_url(session: Session, value: Optional[str]) -> Optional[
 
 
 def _clean_ingest_tags(tags: Optional[List[str]], city: Optional[str] = None) -> List[str]:
-    cleaned: list[str] = []
-    for tag in tags or []:
-        item = str(tag or "").strip()
-        if item:
-            cleaned.append(item)
-    if city:
-        cleaned.append(f"city:{city.strip().lower()}")
-    return sorted(set(cleaned))
+    return clean_ingest_tags(tags, city)
 
 
 def _derive_org_name(source_url: Optional[str], fallback: Optional[str] = None) -> str:
-    preferred = str(fallback or "").strip()
-    if preferred:
-        return preferred
-    source = _normalize_ingest_url(source_url)
-    if source:
-        host = source.split("://", 1)[1].split("/", 1)[0]
-        host = host.replace("www.", "")
-        return host
-    return "Organization"
+    return derive_org_name(source_url, fallback)
 
 
 def _build_ingest_event_key(item: CalendarIngestEvent) -> str:
@@ -2287,12 +4597,7 @@ def _derive_public_event_org_name(raw_event: Dict[str, Any], host_org_source_url
 
 
 def _city_from_feed_url(feed_url: str) -> Optional[str]:
-    cleaned = feed_url.split("://", 1)[-1]
-    path = "/" + cleaned.split("/", 1)[1] if "/" in cleaned else ""
-    segments = [segment for segment in path.split("/") if segment]
-    if len(segments) >= 2 and segments[-1].lower() == "upcoming_events.json":
-        return segments[-2].strip().lower() or None
-    return None
+    return city_from_feed_url(feed_url)
 
 
 def _build_ingest_payload_from_public_feed(
@@ -2490,9 +4795,346 @@ def _validate_public_url(url: Optional[str], field_name: str) -> Optional[str]:
     cleaned = url.strip()
     if not cleaned:
         return None
-    if not re.match(r"^https?://", cleaned, flags=re.IGNORECASE):
+    try:
+        parsed = urlparse(cleaned)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be a valid URL")
+    if parsed.scheme.lower() not in {"http", "https"}:
         raise HTTPException(status_code=422, detail=f"{field_name} must start with http:// or https://")
-    return cleaned
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        raise HTTPException(status_code=422, detail=f"{field_name} must include a hostname")
+    if hostname in {"localhost"} or hostname.endswith(".local"):
+        raise HTTPException(status_code=422, detail=f"{field_name} must use a public hostname")
+    try:
+        ip_value = ipaddress.ip_address(hostname)
+    except ValueError:
+        ip_value = None
+    if ip_value and (
+        ip_value.is_private
+        or ip_value.is_loopback
+        or ip_value.is_link_local
+        or ip_value.is_multicast
+        or ip_value.is_reserved
+        or ip_value.is_unspecified
+    ):
+        raise HTTPException(status_code=422, detail=f"{field_name} must use a public hostname")
+    return parsed._replace(fragment="").geturl()
+
+
+def _is_disallowed_public_ip(ip_value: ipaddress._BaseAddress) -> bool:
+    return (
+        ip_value.is_private
+        or ip_value.is_loopback
+        or ip_value.is_link_local
+        or ip_value.is_multicast
+        or ip_value.is_reserved
+        or ip_value.is_unspecified
+    )
+
+
+def _ensure_public_fetch_url(url: str, field_name: str = "source_url") -> str:
+    normalized = _validate_public_url(url, field_name)
+    if not normalized:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be a valid public URL")
+    parsed = urlparse(normalized)
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        raise HTTPException(status_code=422, detail=f"{field_name} must include a hostname")
+
+    try:
+        resolved = socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise HTTPException(status_code=422, detail=f"{field_name} host could not be resolved")
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"{field_name} host validation failed: {exc}")
+
+    for result in resolved:
+        candidate = result[4][0]
+        try:
+            ip_value = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if _is_disallowed_public_ip(ip_value):
+            raise HTTPException(status_code=422, detail=f"{field_name} must resolve to a public host")
+    return normalized
+
+
+def _truncate_preview_text(value: Optional[str], limit: int) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    compact = re.sub(r"\s+", " ", raw).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _meta_content_from_soup(soup: BeautifulSoup, *, property_name: Optional[str] = None, name: Optional[str] = None) -> Optional[str]:
+    selector: dict[str, str] = {}
+    if property_name:
+        selector["property"] = property_name
+    if name:
+        selector["name"] = name
+    if not selector:
+        return None
+    tag = soup.find("meta", attrs=selector)
+    if not tag:
+        return None
+    return _truncate_preview_text(str(tag.get("content") or ""), 5000)
+
+
+async def _fetch_chat_link_preview(url: str) -> ChatLinkPreviewResponse:
+    safe_url = _ensure_public_fetch_url(url, "url")
+    parsed_safe = urlparse(safe_url)
+    if parsed_safe.username or parsed_safe.password:
+        raise HTTPException(status_code=422, detail="url must not include embedded credentials")
+    if parsed_safe.port and parsed_safe.port not in {80, 443}:
+        raise HTTPException(status_code=422, detail="url must use standard http/https ports")
+
+    timeout = httpx.Timeout(connect=6.0, read=6.0, write=6.0, pool=6.0)
+    headers = {
+        "User-Agent": "ArkavoOrgPortalLinkPreview/1.0 (+https://dev.portal.arkavo.org)",
+        "Accept": "text/html,application/xhtml+xml;q=0.9",
+    }
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, max_redirects=4) as client:
+        response = await client.get(safe_url, headers=headers)
+
+    if not response.is_success:
+        raise HTTPException(status_code=422, detail=f"Link returned HTTP {response.status_code}")
+    if len(response.content or b"") > 1_000_000:
+        raise HTTPException(status_code=422, detail="Link preview source is too large")
+    content_type = str(response.headers.get("content-type") or "").lower()
+    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+        raise HTTPException(status_code=422, detail="Link preview supports HTML pages only")
+
+    resolved_url = _ensure_public_fetch_url(str(response.url), "url")
+    soup = BeautifulSoup(response.text or "", "html.parser")
+    title = (
+        _meta_content_from_soup(soup, property_name="og:title")
+        or _meta_content_from_soup(soup, name="twitter:title")
+        or _truncate_preview_text(soup.title.get_text(" ", strip=True) if soup.title else "", 180)
+    )
+    description = (
+        _meta_content_from_soup(soup, property_name="og:description")
+        or _meta_content_from_soup(soup, name="description")
+        or _meta_content_from_soup(soup, name="twitter:description")
+    )
+    if description:
+        description = _truncate_preview_text(description, 320)
+
+    image_raw = (
+        _meta_content_from_soup(soup, property_name="og:image")
+        or _meta_content_from_soup(soup, name="twitter:image")
+    )
+    image_url = _coerce_public_url_candidate(urljoin(resolved_url, image_raw), "image_url") if image_raw else None
+
+    canonical_raw = ""
+    canonical_link = soup.find("link", attrs={"rel": lambda value: value and "canonical" in str(value).lower()})
+    if canonical_link and canonical_link.get("href"):
+        canonical_raw = str(canonical_link.get("href") or "").strip()
+    canonical_url = _coerce_public_url_candidate(urljoin(resolved_url, canonical_raw), "canonical_url") if canonical_raw else None
+    canonical_url = canonical_url or resolved_url
+
+    parsed_domain = urlparse(canonical_url or resolved_url)
+    domain = (parsed_domain.hostname or "").strip().lower() or None
+    site_name = (
+        _meta_content_from_soup(soup, property_name="og:site_name")
+        or _meta_content_from_soup(soup, name="application-name")
+        or domain
+    )
+    return ChatLinkPreviewResponse(
+        url=safe_url,
+        canonical_url=canonical_url,
+        title=_truncate_preview_text(title, 180),
+        description=description,
+        image_url=image_url,
+        site_name=_truncate_preview_text(site_name, 80),
+        domain=domain,
+    )
+
+
+def _dedupe_contact_links(links: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    deduped: list[dict[str, str]] = []
+    for entry in links:
+        label = str(entry.get("label") or "").strip()
+        url = str(entry.get("url") or "").strip()
+        if not label or not url:
+            continue
+        key = (label.lower(), url.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append({"label": label, "url": url})
+    return deduped
+
+
+def _extract_contact_import_from_html(source_url: str, html_text: str) -> dict[str, Any]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    title_text = (soup.title.get_text(" ", strip=True) if soup.title else "").strip()
+    h1_text = ""
+    first_h1 = soup.find("h1")
+    if first_h1:
+        h1_text = first_h1.get_text(" ", strip=True).strip()
+
+    headline = ""
+    if title_text:
+        headline = title_text.split("|")[0].strip()
+    if not headline and h1_text:
+        headline = h1_text
+
+    email_public: Optional[str] = None
+    phone_public: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    github_url: Optional[str] = None
+    x_url: Optional[str] = None
+    website_url: Optional[str] = None
+    links: list[dict[str, str]] = []
+
+    for anchor in soup.find_all("a", href=True):
+        href = (anchor.get("href") or "").strip()
+        if not href:
+            continue
+        label = anchor.get_text(" ", strip=True) or "Link"
+        href_lower = href.lower()
+
+        if href_lower.startswith("mailto:"):
+            candidate = href.split(":", 1)[1].strip()
+            if candidate and not email_public:
+                email_public = candidate.lower()
+            continue
+        if href_lower.startswith("tel:"):
+            candidate = href.split(":", 1)[1].strip()
+            if candidate and not phone_public:
+                phone_public = candidate
+            continue
+        if not href_lower.startswith("http://") and not href_lower.startswith("https://"):
+            continue
+
+        normalized = _validate_public_url(href, "imported_link_url")
+        if not normalized:
+            continue
+        host = (urlparse(normalized).hostname or "").lower()
+        if "linkedin.com" in host and not linkedin_url:
+            linkedin_url = normalized
+        elif "github.com" in host and not github_url:
+            github_url = normalized
+        elif ("twitter.com" in host or "x.com" in host) and not x_url:
+            x_url = normalized
+        elif not website_url and host not in {"www.linkedin.com", "linkedin.com", "github.com", "www.github.com", "twitter.com", "www.twitter.com", "x.com", "www.x.com"}:
+            website_url = normalized
+        links.append({"label": label.strip()[:120] or "Link", "url": normalized})
+
+    body = soup.body
+    body_text = body.get_text("\n", strip=True) if body else soup.get_text("\n", strip=True)
+    bio = ""
+    if body_text:
+        pre_contact = body_text.split("Contact Information", 1)[0].strip()
+        if h1_text:
+            pre_contact = re.sub(rf"^\s*{re.escape(h1_text)}\s*", "", pre_contact, count=1, flags=re.IGNORECASE).strip()
+        pre_contact = re.sub(r"\s+", " ", pre_contact).strip()
+        if pre_contact:
+            bio = pre_contact[:2000]
+
+    photo_url: Optional[str] = None
+    main_section = soup.find(id="main") or soup.body
+    if main_section:
+        img = main_section.find("img")
+        if img and img.get("src"):
+            photo_url = _validate_public_url(urljoin(source_url, img.get("src")), "photo_url")
+
+    return {
+        "headline": headline[:255] if headline else None,
+        "bio": bio or None,
+        "photo_url": photo_url,
+        "email_public": email_public,
+        "phone_public": phone_public,
+        "linkedin_url": linkedin_url,
+        "github_url": github_url,
+        "x_url": x_url,
+        "website_url": website_url,
+        "links": _dedupe_contact_links(links)[:20],
+    }
+
+
+def _fetch_public_profile_import(source_url: str) -> dict[str, Any]:
+    try:
+        response = requests.get(
+            source_url,
+            timeout=12,
+            headers={
+                "User-Agent": "ArkavoOrgPortalProfileImporter/1.0 (+https://dev.portal.arkavo.org)",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            allow_redirects=True,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=422, detail=f"Failed to fetch source profile: {exc}")
+    if response.status_code >= 400:
+        raise HTTPException(status_code=422, detail=f"Source profile returned HTTP {response.status_code}")
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+        raise HTTPException(status_code=422, detail="Source profile must be an HTML page")
+    if len(response.content) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=422, detail="Source profile is too large")
+    final_url = _ensure_public_fetch_url(response.url, "source_url")
+    return _extract_contact_import_from_html(final_url, response.text)
+
+
+def _apply_contact_import_to_record(
+    contact: UserContactPage,
+    imported: dict[str, Any],
+    overwrite: bool,
+) -> list[str]:
+    changed: list[str] = []
+
+    url_fields = {"photo_url", "linkedin_url", "github_url", "x_url", "website_url"}
+    simple_fields = {
+        "headline",
+        "bio",
+        "photo_url",
+        "email_public",
+        "phone_public",
+        "linkedin_url",
+        "github_url",
+        "x_url",
+        "website_url",
+    }
+
+    for field_name in simple_fields:
+        candidate = imported.get(field_name)
+        if candidate is None:
+            continue
+        current_value = getattr(contact, field_name, None)
+        if not overwrite and current_value:
+            continue
+        if field_name in url_fields:
+            candidate = _validate_public_url(candidate, field_name)
+        if current_value != candidate:
+            setattr(contact, field_name, candidate)
+            changed.append(field_name)
+
+    imported_links = imported.get("links") or []
+    if imported_links:
+        normalized_links = _dedupe_contact_links(
+            [
+                {"label": str(item.get("label") or "").strip(), "url": _validate_public_url(item.get("url"), "links.url") or ""}
+                for item in imported_links
+                if isinstance(item, dict) and item.get("url")
+            ]
+        )
+        if overwrite:
+            if (contact.links or []) != normalized_links:
+                contact.links = normalized_links
+                changed.append("links")
+        else:
+            merged = _dedupe_contact_links(list(contact.links or []) + normalized_links)
+            if merged != (contact.links or []):
+                contact.links = merged
+                changed.append("links")
+
+    return changed
 
 
 def _throttle_action(key: str, limit: int, window_seconds: int) -> None:
@@ -2509,6 +5151,208 @@ def _throttle_action(key: str, limit: int, window_seconds: int) -> None:
         raise
     except Exception as exc:
         logger.warning(f"Rate limit check skipped: {exc}")
+
+
+def _request_client_ip(request: Request) -> str:
+    forwarded_for = (request.headers.get("x-forwarded-for") or "").strip()
+    candidate = ""
+    if forwarded_for:
+        candidate = forwarded_for.split(",")[0].strip()
+    if not candidate:
+        candidate = (request.headers.get("x-real-ip") or "").strip()
+    if not candidate and request.client:
+        candidate = (request.client.host or "").strip()
+    if not candidate:
+        return "unknown"
+    try:
+        ip_obj = ipaddress.ip_address(candidate)
+        return ip_obj.compressed
+    except ValueError:
+        return "unknown"
+
+
+def _business_card_extension_for_content_type(content_type: str) -> str:
+    normalized = (content_type or "").strip().lower()
+    if normalized == "image/jpeg":
+        return ".jpg"
+    if normalized == "image/png":
+        return ".png"
+    if normalized == "image/webp":
+        return ".webp"
+    return ".img"
+
+
+def _business_card_storage_root() -> Path:
+    return Path(ORG_BUSINESS_CARD_STORAGE_DIR).resolve()
+
+
+def _business_card_storage_backend() -> str:
+    backend = (ORG_BUSINESS_CARD_STORAGE_BACKEND or "local").strip().lower()
+    if backend not in {"local", "s3"}:
+        return "local"
+    return backend
+
+
+def _business_card_s3_object_key(
+    *,
+    submission_id: uuid.UUID,
+    content_type: str,
+    now: Optional[datetime] = None,
+) -> str:
+    ts = now or datetime.now(timezone.utc)
+    extension = _business_card_extension_for_content_type(content_type)
+    key_parts = [str(ts.year), f"{ts.month:02d}", f"{submission_id}{extension}"]
+    if ORG_BUSINESS_CARD_S3_PREFIX:
+        key_parts.insert(0, ORG_BUSINESS_CARD_S3_PREFIX)
+    return "/".join(key_parts)
+
+
+def _build_business_card_s3_client():
+    if not ORG_BUSINESS_CARD_S3_ACCESS_KEY or not ORG_BUSINESS_CARD_S3_SECRET_KEY:
+        raise RuntimeError("S3 storage credentials are not configured")
+    try:
+        import boto3
+        from botocore.config import Config
+    except Exception as exc:
+        raise RuntimeError("boto3 is required for ORG_BUSINESS_CARD_STORAGE_BACKEND=s3") from exc
+
+    session = boto3.session.Session()
+    return session.client(
+        "s3",
+        endpoint_url=ORG_BUSINESS_CARD_S3_ENDPOINT_URL or None,
+        aws_access_key_id=ORG_BUSINESS_CARD_S3_ACCESS_KEY,
+        aws_secret_access_key=ORG_BUSINESS_CARD_S3_SECRET_KEY,
+        region_name=ORG_BUSINESS_CARD_S3_REGION,
+        use_ssl=ORG_BUSINESS_CARD_S3_USE_SSL,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+
+
+def _ensure_business_card_s3_bucket() -> None:
+    if not ORG_BUSINESS_CARD_STORAGE_ENABLED or _business_card_storage_backend() != "s3":
+        return
+    client = _build_business_card_s3_client()
+    bucket = ORG_BUSINESS_CARD_S3_BUCKET
+    try:
+        client.head_bucket(Bucket=bucket)
+        return
+    except Exception:
+        pass
+    create_kwargs = {"Bucket": bucket}
+    if ORG_BUSINESS_CARD_S3_REGION and ORG_BUSINESS_CARD_S3_REGION != "us-east-1":
+        create_kwargs["CreateBucketConfiguration"] = {
+            "LocationConstraint": ORG_BUSINESS_CARD_S3_REGION
+        }
+    client.create_bucket(**create_kwargs)
+
+
+def _persist_business_card_image(
+    *,
+    submission_id: uuid.UUID,
+    image_bytes: bytes,
+    content_type: str,
+) -> tuple[str, Optional[str], str]:
+    if not ORG_BUSINESS_CARD_STORAGE_ENABLED:
+        return ("disabled", None, "")
+    backend = _business_card_storage_backend()
+    if backend == "s3":
+        object_key = _business_card_s3_object_key(
+            submission_id=submission_id,
+            content_type=content_type,
+        )
+        client = _build_business_card_s3_client()
+        client.put_object(
+            Bucket=ORG_BUSINESS_CARD_S3_BUCKET,
+            Key=object_key,
+            Body=image_bytes,
+            ContentType=content_type or "application/octet-stream",
+        )
+        return ("s3", ORG_BUSINESS_CARD_S3_BUCKET, object_key)
+
+    root = _business_card_storage_root()
+    now = datetime.now(timezone.utc)
+    relative_dir = Path(str(now.year), f"{now.month:02d}")
+    target_dir = root / relative_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    extension = _business_card_extension_for_content_type(content_type)
+    target_name = f"{submission_id}{extension}"
+    target_path = target_dir / target_name
+    temp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+    temp_path.write_bytes(image_bytes)
+    temp_path.replace(target_path)
+    return ("local", None, str(relative_dir / target_name))
+
+
+def _resolve_business_card_storage_path(relative_path: str) -> Path:
+    root = _business_card_storage_root()
+    candidate = (root / relative_path).resolve()
+    if not str(candidate).startswith(str(root)):
+        raise HTTPException(status_code=400, detail="Invalid storage path")
+    return candidate
+
+
+def _load_business_card_image_bytes(
+    *,
+    storage_backend: str,
+    storage_bucket: Optional[str],
+    storage_path: str,
+) -> bytes:
+    backend = (storage_backend or "local").strip().lower()
+    if backend == "s3":
+        bucket = (storage_bucket or ORG_BUSINESS_CARD_S3_BUCKET).strip()
+        if not bucket:
+            raise HTTPException(status_code=500, detail="S3 bucket not configured for stored image")
+        client = _build_business_card_s3_client()
+        response = client.get_object(Bucket=bucket, Key=storage_path)
+        body = response.get("Body")
+        data = body.read() if body else b""
+        if not data:
+            raise HTTPException(status_code=404, detail="Stored image file missing")
+        return data
+
+    image_path = _resolve_business_card_storage_path(storage_path)
+    if not image_path.exists() or not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Stored image file missing")
+    return image_path.read_bytes()
+
+
+def _scan_created_target_image_url(
+    submission_id: uuid.UUID,
+    *,
+    target_type: str,
+    target_id: Optional[str],
+) -> Optional[str]:
+    normalized_type = str(target_type or "").strip().lower()
+    normalized_id = str(target_id or "").strip()
+    if normalized_type not in {"organization", "event"} or not normalized_id:
+        return None
+    return f"/api/network/scans/{submission_id}/image/public/{normalized_type}/{normalized_id}"
+
+
+def _enforce_business_card_duplicate_hash_guard(
+    session: Session,
+    *,
+    image_sha256: str,
+    duplicate_hash_limit: int,
+    duplicate_hash_window_seconds: int,
+) -> None:
+    if duplicate_hash_limit <= 0 or duplicate_hash_window_seconds <= 0:
+        return
+    window_start = datetime.now(timezone.utc) - timedelta(seconds=duplicate_hash_window_seconds)
+    existing_count = (
+        session.query(func.count(BusinessCardSubmission.id))
+        .filter(
+            BusinessCardSubmission.image_sha256 == image_sha256,
+            BusinessCardSubmission.created_at >= window_start,
+        )
+        .scalar()
+        or 0
+    )
+    if int(existing_count) >= duplicate_hash_limit:
+        raise HTTPException(
+            status_code=429,
+            detail="Duplicate business card submissions exceeded for this time window",
+        )
 
 
 def _audit_event(
@@ -2609,7 +5453,7 @@ def _seed_organizations_from_event_sources(session: Session, force_update: bool 
 
 
 def _is_org_admin(org: Organization, current_user: dict) -> bool:
-    if current_user.get("is_admin"):
+    if _is_sysadmin(current_user):
         return True
     current_user_id = _actor_user_id(current_user)
     if not current_user_id:
@@ -2623,13 +5467,105 @@ def _is_org_admin(org: Organization, current_user: dict) -> bool:
 
 
 def _can_manage_org_for_merge(org: Organization, current_user: dict) -> bool:
-    if current_user.get("is_admin"):
+    if _is_sysadmin(current_user):
         return True
     # For unclaimed organizations, any authenticated user can fold duplicates into
     # an org they already manage.
     if not org.claimed_by_user_id:
         return True
     return _is_org_admin(org, current_user)
+
+
+def _is_any_org_admin(session: Session, current_user: dict) -> bool:
+    if _is_sysadmin(current_user):
+        return True
+    user_id = _actor_user_id(current_user)
+    if not user_id:
+        return False
+    claimed_org = (
+        session.query(Organization.id)
+        .filter(Organization.claimed_by_user_id == user_id)
+        .first()
+    )
+    if claimed_org:
+        return True
+    member_admin = (
+        session.query(OrganizationMembership.id)
+        .filter(
+            OrganizationMembership.user_id == user_id,
+            OrganizationMembership.role == "admin",
+        )
+        .first()
+    )
+    return bool(member_admin)
+
+
+def _has_active_team_membership(session: Session, user_id: str) -> bool:
+    if not user_id:
+        return False
+    row = (
+        session.query(TeamMembership.id)
+        .join(Team, Team.id == TeamMembership.team_id)
+        .filter(
+            TeamMembership.user_id == user_id,
+            TeamMembership.active.is_(True),
+            Team.status == "active",
+        )
+        .first()
+    )
+    return bool(row)
+
+
+def _has_recent_attendance(session: Session, user_id: str, days: int = 90) -> bool:
+    if not user_id:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    row = (
+        session.query(EventAttendance.id)
+        .filter(
+            EventAttendance.user_id == user_id,
+            EventAttendance.attended_at >= cutoff,
+        )
+        .first()
+    )
+    return bool(row)
+
+
+def _resolve_access_classes(session: Session, current_user: dict) -> AccessClassSnapshotResponse:
+    if current_user.get("is_anonymous"):
+        return AccessClassSnapshotResponse(
+            is_public=True,
+            is_attendee=False,
+            is_member=False,
+            is_org_admin=False,
+            is_sysadmin=False,
+            reasons=["Unauthenticated user defaults to Public class."],
+        )
+
+    user_id = _actor_user_id(current_user)
+    is_sysadmin = _is_sysadmin(current_user)
+    is_org_admin = _is_any_org_admin(session, current_user)
+    is_attendee = _has_recent_attendance(session, user_id, days=90)
+    is_member = is_org_admin or _has_active_team_membership(session, user_id)
+    reasons: list[str] = []
+    if is_sysadmin:
+        reasons.append("Platform SysAdmin privileges are active.")
+    if is_org_admin:
+        reasons.append("User has organization admin authority (owner/membership or SysAdmin override).")
+    if is_attendee:
+        reasons.append("User has recorded attendance within the last 90 days.")
+    if is_member:
+        reasons.append("User is treated as Member due to org admin authority or active team participation.")
+    if not reasons:
+        reasons.append("Authenticated user defaults to Public class.")
+    return AccessClassSnapshotResponse(
+        is_public=True,
+        is_attendee=is_attendee,
+        is_member=is_member,
+        is_org_admin=is_org_admin,
+        is_sysadmin=is_sysadmin,
+        reasons=reasons,
+    )
 
 
 def _claim_org_record(session: Session, org: Organization, current_user: dict) -> None:
@@ -2677,111 +5613,10 @@ def _claim_org_record(session: Session, org: Organization, current_user: dict) -
 
 # ============= ECONOMIC ENGINE =============
 
-class EconomicEngine:
-    @staticmethod
-    def calculate_tax(income: Decimal, entity_type: EntityType) -> Decimal:
-        """Calculate tax with progressive rates"""
-        if entity_type == EntityType.NONPROFIT:
-            return Decimal('0.00')
+class EconomicEngine(DomainEconomicEngine):
+    """Compatibility shim; implementation now lives under domain.economy."""
 
-        tax_brackets = [
-            (Decimal('0.00'), Decimal('25000.00'), Decimal('0.10')),
-            (Decimal('25000.01'), Decimal('50000.00'), Decimal('0.15')),
-            (Decimal('50000.01'), Decimal('100000.00'), Decimal('0.20')),
-            (Decimal('100000.01'), Decimal('500000.00'), Decimal('0.25')),
-            (Decimal('500000.01'), None, Decimal('0.30')),
-        ]
-        
-        tax = Decimal('0.00')
-        remaining_income = income
-        
-        for lower, upper, rate in tax_brackets:
-            if remaining_income <= Decimal('0.00'):
-                break
-            
-            if upper is None or remaining_income <= (upper - lower):
-                tax += remaining_income * rate
-                break
-            else:
-                bracket_income = upper - lower
-                tax += bracket_income * rate
-                remaining_income -= bracket_income
-        
-        return tax.quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-    
-    @staticmethod
-    def calculate_insurance_premium(
-        insurance_type: InsuranceType,
-        coverage_amount: Decimal,
-        risk_factors: Dict[str, Any]
-    ) -> Decimal:
-        """Calculate insurance premium based on risk factors"""
-        base_rates = {
-            InsuranceType.LIFE: Decimal('0.0005'),  # 0.05% per year
-            InsuranceType.HEALTH: Decimal('0.01'),   # 1% per year
-            InsuranceType.FIRE: Decimal('0.0015'),   # 0.15% per year
-            InsuranceType.ACTS_OF_GOD: Decimal('0.002'),  # 0.2% per year
-        }
-        
-        base_premium = coverage_amount * base_rates[insurance_type]
-        
-        # Apply risk factors
-        risk_multiplier = Decimal('1.0')
-        
-        if insurance_type == InsuranceType.LIFE:
-            age = risk_factors.get('age', 35)
-            if age > 60:
-                risk_multiplier *= Decimal('2.5')
-            elif age > 45:
-                risk_multiplier *= Decimal('1.5')
-            elif age < 25:
-                risk_multiplier *= Decimal('0.7')
-        
-        elif insurance_type == InsuranceType.HEALTH:
-            health_score = risk_factors.get('health_score', 75)
-            if health_score < 50:
-                risk_multiplier *= Decimal('2.0')
-            elif health_score > 85:
-                risk_multiplier *= Decimal('0.8')
-        
-        elif insurance_type == InsuranceType.FIRE:
-            location_risk = risk_factors.get('location_risk', 'medium')
-            if location_risk == 'high':
-                risk_multiplier *= Decimal('2.0')
-            elif location_risk == 'low':
-                risk_multiplier *= Decimal('0.8')
-        
-        return (base_premium * risk_multiplier).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-    
-    @staticmethod
-    def calculate_stock_price_variation(
-        current_price: Decimal,
-        volume: int,
-        market_sentiment: Decimal,
-        volatility: Decimal = Decimal('0.02')
-    ) -> Decimal:
-        """Calculate stock price variation using geometric Brownian motion"""
-        import random
-        import math
-        
-        # Random component (Wiener process)
-        z = Decimal(str(random.gauss(0, 1)))
-        
-        # Drift based on market sentiment (0 to 1 scale, where 0.5 is neutral)
-        drift = (market_sentiment - Decimal('0.5')) * Decimal('0.01')
-        
-        # Volatility adjustment based on volume
-        volume_factor = Decimal(str(min(math.log(volume + 1) / 10, 0.1)))
-        
-        # Calculate price change
-        price_change = drift + (volatility * z) + volume_factor
-        
-        # Apply change with bounds
-        new_price = current_price * (Decimal('1.0') + price_change)
-        
-        # Ensure price doesn't drop below minimum
-        min_price = current_price * Decimal('0.01')  # Minimum 1% of current price
-        return max(new_price, min_price).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+    pass
 
 
 # ============= ORG NETWORK ENDPOINTS =============
@@ -2925,8 +5760,8 @@ async def seed_organizations(
     session: Session = Depends(get_db),
 ):
     _require_authenticated_user(current_user)
-    if not current_user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Admin privileges required")
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
     return _seed_organizations_from_event_sources(session, force_update=force_update)
 
 
@@ -2958,6 +5793,88 @@ async def list_organizations(
             or any(m.user_id == user_id for m in org.memberships or [])
         ]
     return [_map_org(org, user_id) for org in organizations]
+
+
+@app.get("/api/network/teams", response_model=List[TeamResponse])
+async def list_teams(
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+    q: str = "",
+    active_only: bool = True,
+    limit: int = 200,
+    offset: int = 0,
+):
+    _require_authenticated_user(current_user)
+    safe_limit = max(1, min(limit, 1000))
+    safe_offset = max(0, min(offset, 100000))
+    query = session.query(Team)
+    if q.strip():
+        needle = f"%{q.strip()}%"
+        query = query.filter((Team.name.ilike(needle)) | (Team.slug.ilike(needle)))
+    if active_only:
+        query = query.filter(Team.status == "active")
+    return query.order_by(Team.name.asc()).offset(safe_offset).limit(safe_limit).all()
+
+
+@app.post("/api/network/teams", response_model=TeamResponse)
+async def create_team(
+    payload: TeamCreate,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
+    team = Team(
+        id=uuid.uuid4(),
+        name=payload.name.strip(),
+        slug=_ensure_unique_team_slug(session, payload.name.strip()),
+        description=(payload.description or "").strip() or None,
+        status="active",
+        created_by_user_id=_actor_user_id(current_user),
+    )
+    session.add(team)
+    session.commit()
+    session.refresh(team)
+    return team
+
+
+@app.post("/api/network/teams/{team_id}/members", response_model=TeamMembershipResponse)
+async def upsert_team_membership(
+    team_id: uuid.UUID,
+    payload: TeamMembershipUpsert,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
+    team = session.query(Team).filter(Team.id == team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+    user_id = payload.user_id.strip()
+    membership = (
+        session.query(TeamMembership)
+        .filter(
+            TeamMembership.team_id == team.id,
+            TeamMembership.user_id == user_id,
+        )
+        .first()
+    )
+    if not membership:
+        membership = TeamMembership(
+            id=uuid.uuid4(),
+            team_id=team.id,
+            user_id=user_id,
+        )
+        session.add(membership)
+    membership.user_email = payload.user_email
+    membership.user_name = payload.user_name
+    membership.role = payload.role
+    membership.active = payload.active
+    session.commit()
+    session.refresh(membership)
+    return membership
 
 
 @app.get("/api/network/orgs/public", response_model=List[PublicOrganizationListItemResponse])
@@ -3304,7 +6221,7 @@ async def unclaim_organization(
         raise HTTPException(status_code=404, detail="Organization not found")
     if org.claimed_by_user_id is None:
         return _map_org(org, user_id)
-    if not current_user.get("is_admin") and org.claimed_by_user_id != user_id:
+    if not _is_sysadmin(current_user) and org.claimed_by_user_id != user_id:
         raise HTTPException(status_code=403, detail="Only the claiming user or an admin can unclaim this organization")
 
     previous_owner = org.claimed_by_user_id
@@ -3524,6 +6441,39 @@ async def list_public_network_events(
     return [_map_network_event(event, None, session) for event in events]
 
 
+@app.get("/api/network/events/public.json", response_model=NetworkEventPublicFeedResponse)
+async def list_public_network_events_json(
+    session: Session = Depends(get_db),
+    q: str = "",
+    upcoming_only: bool = False,
+):
+    now_utc = datetime.now(timezone.utc)
+    query = session.query(NetworkEvent)
+
+    if q.strip():
+        needle = f"%{q.strip()}%"
+        query = query.filter(
+            (NetworkEvent.title.ilike(needle))
+            | (NetworkEvent.slug.ilike(needle))
+            | (NetworkEvent.location.ilike(needle))
+            | (NetworkEvent.description.ilike(needle))
+        )
+
+    if upcoming_only:
+        query = query.filter(
+            (NetworkEvent.ends_at.isnot(None) & (NetworkEvent.ends_at >= now_utc))
+            | (NetworkEvent.ends_at.is_(None) & NetworkEvent.starts_at.isnot(None) & (NetworkEvent.starts_at >= now_utc))
+        )
+
+    events = query.order_by(NetworkEvent.starts_at.asc().nullslast(), NetworkEvent.created_at.desc()).all()
+    mapped_events = [_map_network_event(event, None, session) for event in events]
+    return NetworkEventPublicFeedResponse(
+        generated_at=datetime.now(timezone.utc),
+        total=len(mapped_events),
+        events=mapped_events,
+    )
+
+
 @app.get("/api/network/events/public/{slug}", response_model=NetworkEventResponse)
 async def get_public_network_event_by_slug(
     slug: str,
@@ -3663,7 +6613,7 @@ async def unclaim_network_event(
         raise HTTPException(status_code=404, detail="Event not found")
     if event.claimed_by_user_id is None:
         return _map_network_event(event, current_user, session)
-    if not current_user.get("is_admin") and event.claimed_by_user_id != user_id:
+    if not _is_sysadmin(current_user) and event.claimed_by_user_id != user_id:
         raise HTTPException(status_code=403, detail="Only the claiming user or an admin can unclaim this event")
 
     previous_owner = event.claimed_by_user_id
@@ -3680,6 +6630,803 @@ async def unclaim_network_event(
     session.commit()
     session.refresh(event)
     return _map_network_event(event, current_user, session)
+
+
+@app.post("/api/network/events/{event_id}/attendance", response_model=EventAttendanceRecordResponse)
+async def record_event_attendance(
+    event_id: uuid.UUID,
+    user_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    event = session.query(NetworkEvent).filter(NetworkEvent.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    actor_user_id = _actor_user_id(current_user)
+    target_user_id = (user_id or "").strip() or actor_user_id
+    if target_user_id != actor_user_id and not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="Only SysAdmin can record attendance for another user")
+
+    attendance = (
+        session.query(EventAttendance)
+        .filter(
+            EventAttendance.event_id == event_id,
+            EventAttendance.user_id == target_user_id,
+        )
+        .first()
+    )
+    if not attendance:
+        attendance = EventAttendance(
+            id=uuid.uuid4(),
+            event_id=event_id,
+            user_id=target_user_id,
+        )
+        session.add(attendance)
+
+    if target_user_id == actor_user_id:
+        attendance.user_email = current_user.get("email")
+        attendance.user_name = current_user.get("name")
+    attendance.attended_at = datetime.now(timezone.utc)
+    attendance.source = "sysadmin_override" if target_user_id != actor_user_id else "self_checkin"
+    attendance.verified_by_user_id = actor_user_id if target_user_id != actor_user_id else None
+    session.commit()
+    session.refresh(attendance)
+    return attendance
+
+
+@app.post("/api/network/scans", response_model=BusinessCardSubmissionResponse)
+@app.post("/api/network/business-cards", response_model=BusinessCardSubmissionResponse)
+async def submit_business_card(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    image: UploadFile = File(...),
+    notes: Optional[str] = Form(None),
+    scan_kind: Optional[str] = Form("auto"),
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    submission_id = uuid.uuid4()
+    actor_user_id = _actor_user_id(current_user)
+
+    def _scan_audit(event_type: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        _audit_event(
+            session,
+            actor=current_user,
+            event_type=event_type,
+            target_type="business_card_submission",
+            target_id=str(submission_id),
+            metadata=metadata or {},
+        )
+
+    ai_audit_steps: list[dict[str, Any]] = []
+
+    def _scan_ai_audit_hook(event_type: str, metadata: Dict[str, Any]) -> None:
+        payload = metadata or {}
+        ai_audit_steps.append({"event_type": event_type, "metadata": payload})
+        _scan_audit(event_type, payload)
+
+    _scan_audit("scan.received", {"scan_kind_requested": _normalize_scan_kind(scan_kind)})
+    runtime_settings = await get_business_card_runtime_settings()
+    if not runtime_settings.get("enabled", True):
+        raise HTTPException(status_code=503, detail="Business card submissions are temporarily disabled")
+
+    client_ip = _request_client_ip(request)
+    _throttle_action(
+        f"network:business-card-submit:user:{actor_user_id}",
+        limit=int(runtime_settings["per_user_limit_per_hour"]),
+        window_seconds=3600,
+    )
+    _throttle_action(
+        f"network:business-card-submit:ip:{client_ip}",
+        limit=int(runtime_settings["per_ip_limit_per_hour"]),
+        window_seconds=3600,
+    )
+    _throttle_action(
+        "network:business-card-submit:global",
+        limit=int(runtime_settings["global_limit_per_hour"]),
+        window_seconds=3600,
+    )
+
+    content_type = (image.content_type or "").strip().lower()
+    allowed_content_types = {
+        item.strip().lower()
+        for item in runtime_settings.get("allowed_content_types") or []
+        if item and item.strip()
+    } or ORG_BUSINESS_CARD_DEFAULT_ALLOWED_CONTENT_TYPES
+    if content_type not in allowed_content_types:
+        allowed = ", ".join(sorted(allowed_content_types))
+        raise HTTPException(status_code=415, detail=f"Unsupported image content type '{content_type}'. Allowed: {allowed}")
+
+    image_bytes = await image.read()
+    if not image_bytes:
+        raise HTTPException(status_code=422, detail="Image file is empty")
+    max_bytes = int(runtime_settings.get("max_bytes") or ORG_BUSINESS_CARD_DEFAULT_MAX_BYTES)
+    if len(image_bytes) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"Image exceeds {max_bytes} bytes")
+
+    image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+    if not _is_sysadmin(current_user):
+        _enforce_business_card_duplicate_hash_guard(
+            session,
+            image_sha256=image_sha256,
+            duplicate_hash_limit=int(runtime_settings["duplicate_hash_limit"]),
+            duplicate_hash_window_seconds=int(runtime_settings["duplicate_hash_window_seconds"]),
+        )
+    image_storage_path = ""
+    image_storage_backend = ""
+    image_storage_bucket = None
+    image_storage_error = None
+    try:
+        image_storage_backend, image_storage_bucket, image_storage_path = _persist_business_card_image(
+            submission_id=submission_id,
+            image_bytes=image_bytes,
+            content_type=content_type,
+        )
+    except Exception as exc:
+        image_storage_error = str(exc)
+        logger.error("Business card image storage failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Unable to store business card image")
+    _scan_audit(
+        "scan.image.persisted",
+        {
+            "storage_backend": image_storage_backend,
+            "storage_bucket": image_storage_bucket,
+            "content_type": content_type,
+            "image_size_bytes": len(image_bytes),
+        },
+    )
+
+    ocr_text, ocr_provider = await _extract_business_card_text(
+        image_bytes=image_bytes,
+        content_type=content_type,
+        audit_hook=_scan_ai_audit_hook,
+    )
+    extracted_person = _extract_business_card_fields(ocr_text)
+    extracted_org = _extract_organization_fields_from_text(ocr_text)
+    extracted_events = _extract_events_from_text(ocr_text)
+    extracted_event = extracted_events[0] if extracted_events else _extract_event_fields_from_text(ocr_text)
+    person_derived_org = _derive_org_payload_for_person_scan(extracted_person, extracted_org)
+    normalized_scan_kind = _normalize_scan_kind(scan_kind)
+    classification_scores = _score_scan_kind_candidates(
+        ocr_text=ocr_text,
+        extracted_person=extracted_person,
+        extracted_org=extracted_org,
+        extracted_event=extracted_event,
+    )
+    ranked_scores = sorted(classification_scores.items(), key=lambda item: item[1], reverse=True)
+    detected_scan_kind = _detect_scan_kind(
+        ocr_text=ocr_text,
+        extracted_person=extracted_person,
+        extracted_org=extracted_org,
+        extracted_event=extracted_event,
+    )
+    effective_scan_kind = detected_scan_kind if normalized_scan_kind == "auto" else normalized_scan_kind
+    top_confidence = float(ranked_scores[0][1]) if ranked_scores else 0.0
+    second_confidence = float(ranked_scores[1][1]) if len(ranked_scores) > 1 else 0.0
+    confidence_margin = max(0.0, top_confidence - second_confidence)
+    auto_clarification_enabled = bool(
+        runtime_settings.get("auto_clarification_enabled", ORG_SCAN_AUTO_CLARIFICATION_ENABLED)
+    )
+    auto_min_confidence = max(
+        0.0,
+        min(1.0, float(runtime_settings.get("auto_min_confidence", ORG_SCAN_AUTO_MIN_CONFIDENCE))),
+    )
+    auto_min_margin = max(
+        0.0,
+        min(1.0, float(runtime_settings.get("auto_min_margin", ORG_SCAN_AUTO_MIN_MARGIN))),
+    )
+    clarification_required = False
+    clarification_message: Optional[str] = None
+    processing_status = "processed"
+    if (
+        normalized_scan_kind == "auto"
+        and auto_clarification_enabled
+        and (top_confidence < auto_min_confidence or confidence_margin < auto_min_margin)
+    ):
+        clarification_required = True
+        processing_status = "clarification_required"
+        clarification_message = (
+            f"Scan classification confidence ({top_confidence:.2f}) was below policy. "
+            "Please resubmit and select the correct scan type."
+        )
+        _scan_audit(
+            "scan.classification.clarification_required",
+            {
+                "detected_scan_kind": detected_scan_kind,
+                "classification_scores": classification_scores,
+                "top_confidence": top_confidence,
+                "confidence_margin": confidence_margin,
+                "auto_min_confidence": auto_min_confidence,
+                "auto_min_margin": auto_min_margin,
+            },
+        )
+    event_link_enrichment_enabled = bool(runtime_settings.get("event_link_enrichment_enabled", ORG_SCAN_EVENT_LINK_ENRICHMENT_ENABLED))
+
+    event_link_enrichment: Dict[str, Any] = {}
+    if not clarification_required and effective_scan_kind == "event" and event_link_enrichment_enabled:
+        event_link_enrichment = await _enrich_event_scan_from_links(
+            ocr_text=ocr_text,
+            seed_url=extracted_event.get("website"),
+        )
+        candidate = event_link_enrichment.get("event_candidate") or {}
+        if candidate:
+            if not extracted_event.get("title") and candidate.get("title"):
+                extracted_event["title"] = candidate.get("title")
+            if not extracted_event.get("description") and candidate.get("description"):
+                extracted_event["description"] = candidate.get("description")
+            if not extracted_event.get("starts_at") and candidate.get("starts_at"):
+                extracted_event["starts_at"] = candidate.get("starts_at")
+            if not extracted_event.get("location") and candidate.get("location"):
+                extracted_event["location"] = candidate.get("location")
+            if not extracted_event.get("website") and candidate.get("source_url"):
+                extracted_event["website"] = candidate.get("source_url")
+        discovered_links = event_link_enrichment.get("discovered_links") or []
+        if discovered_links and not extracted_event.get("website"):
+            extracted_event["website"] = discovered_links[0]
+        if extracted_events:
+            extracted_events[0] = extracted_event
+        _scan_audit(
+            "scan.event_link_enrichment.completed",
+            {
+                "visited_urls": event_link_enrichment.get("visited_urls") or [],
+                "discovered_links_count": len(discovered_links),
+                "event_candidate_found": bool(candidate),
+            },
+        )
+
+    extracted = extracted_person
+    if effective_scan_kind == "organization":
+        extracted = {
+            "name": extracted_org.get("name"),
+            "title": None,
+            "company": extracted_org.get("name"),
+            "email": None,
+            "phone": None,
+            "website": extracted_org.get("website"),
+            "address": None,
+            "raw_lines": extracted_org.get("raw_lines") or [],
+        }
+    elif effective_scan_kind == "event":
+        starts_at = extracted_event.get("starts_at")
+        starts_at_iso = starts_at.isoformat() if isinstance(starts_at, datetime) else None
+        extracted = {
+            "name": extracted_event.get("title"),
+            "title": None,
+            "company": None,
+            "email": None,
+            "phone": None,
+            "website": extracted_event.get("website"),
+            "address": extracted_event.get("location"),
+            "raw_lines": extracted_event.get("raw_lines") or [],
+            "starts_at": starts_at_iso,
+        }
+
+    extracted_email = str(extracted_person.get("email") or "").strip().lower()
+    pidp_user_result: dict[str, Any] = {"created": False, "pidp_user_id": None}
+    created_targets: List[Dict[str, Optional[str]]] = []
+    created_target_type: Optional[str] = None
+    created_target_id: Optional[str] = None
+    created_target_slug: Optional[str] = None
+    created_target_name: Optional[str] = None
+
+    def _append_created_target(
+        target_type: str,
+        *,
+        target_id: Optional[str] = None,
+        target_slug: Optional[str] = None,
+        target_name: Optional[str] = None,
+        target_image_url: Optional[str] = None,
+    ) -> None:
+        normalized_type = str(target_type or "").strip().lower()
+        normalized_id = str(target_id or "").strip() or None
+        normalized_slug = str(target_slug or "").strip() or None
+        normalized_name = str(target_name or "").strip() or None
+        if not normalized_type:
+            return
+        dedupe_key = (normalized_type, normalized_id or normalized_slug or normalized_name or "")
+        for existing in created_targets:
+            existing_key = (
+                str(existing.get("type") or "").strip().lower(),
+                str(existing.get("id") or existing.get("slug") or existing.get("name") or "").strip(),
+            )
+            if existing_key == dedupe_key:
+                return
+        target_url: Optional[str] = None
+        if normalized_type == "organization" and normalized_slug:
+            target_url = f"/orgs/{normalized_slug}"
+        elif normalized_type == "event" and normalized_slug:
+            target_url = f"/events/{normalized_slug}"
+        created_targets.append(
+            {
+                "type": normalized_type,
+                "id": normalized_id,
+                "slug": normalized_slug,
+                "name": normalized_name,
+                "url": target_url,
+                "image_url": str(target_image_url or "").strip() or None,
+            }
+        )
+
+    normalized_org_name = str(extracted_org.get("name") or "").strip()
+    normalized_person_derived_org_name = str((person_derived_org or {}).get("name") or "").strip()
+    normalized_event_title = str(extracted_event.get("title") or "").strip()
+    has_event_shape = bool(
+        extracted_events
+        or normalized_event_title
+        or extracted_event.get("starts_at")
+        or str(extracted_event.get("website") or "").strip()
+    )
+    should_create_person = False
+    should_create_org = False
+    should_create_event = False
+    if not clarification_required:
+        if normalized_scan_kind == "auto":
+            should_create_person = bool(extracted_email)
+            should_create_org = bool(normalized_org_name or (should_create_person and normalized_person_derived_org_name))
+            should_create_event = has_event_shape
+        elif normalized_scan_kind == "person":
+            should_create_person = True
+            should_create_org = bool(normalized_person_derived_org_name)
+        elif normalized_scan_kind == "organization":
+            should_create_org = True
+        elif normalized_scan_kind == "event":
+            should_create_event = True
+
+    if not clarification_required and normalized_scan_kind == "auto" and not (
+        should_create_person or should_create_org or should_create_event
+    ):
+        clarification_required = True
+        processing_status = "clarification_required"
+        clarification_message = (
+            "No person, organization, or event fields were confidently detected. "
+            "Please retry with a clearer image or choose scan type manually."
+        )
+        _scan_audit(
+            "scan.classification.no_entities_detected",
+            {
+                "detected_scan_kind": detected_scan_kind,
+                "classification_scores": classification_scores,
+            },
+        )
+
+    created_org: Optional[Organization] = None
+    if not clarification_required and should_create_org:
+        org_payload = extracted_org
+        if normalized_scan_kind == "person" and person_derived_org:
+            org_payload = person_derived_org
+        elif normalized_scan_kind == "auto" and should_create_person and person_derived_org:
+            # In auto mode, prefer person-derived company for business-card patterns.
+            org_payload = person_derived_org
+        created_org = _create_or_find_organization_from_scan(
+            session,
+            actor_user_id=actor_user_id,
+            extracted_org=org_payload,
+            default_image_url=None,
+        )
+        created_org_image_url = _scan_created_target_image_url(
+            submission_id,
+            target_type="organization",
+            target_id=str(created_org.id),
+        )
+        if created_org_image_url and (created_org.image_url or "").strip() != created_org_image_url:
+            if not (created_org.image_url or "").strip():
+                created_org.image_url = created_org_image_url
+        _append_created_target(
+            "organization",
+            target_id=str(created_org.id),
+            target_slug=created_org.slug,
+            target_name=created_org.name,
+            target_image_url=created_org.image_url,
+        )
+
+    if not clarification_required and should_create_event:
+        event_candidates = extracted_events or [extracted_event]
+        for event_candidate in event_candidates:
+            event = _create_event_from_scan(
+                session,
+                actor_user_id=actor_user_id,
+                extracted_event=event_candidate,
+                default_image_url=None,
+            )
+            created_event_image_url = _scan_created_target_image_url(
+                submission_id,
+                target_type="event",
+                target_id=str(event.id),
+            )
+            if created_event_image_url and not (event.image_url or "").strip():
+                event.image_url = created_event_image_url
+            if created_org and not event.host_org_id:
+                event.host_type = EventHostType.ORG.value
+                event.host_org_id = created_org.id
+                event.host_user_id = None
+            _append_created_target(
+                "event",
+                target_id=str(event.id),
+                target_slug=event.slug,
+                target_name=event.title,
+                target_image_url=event.image_url,
+            )
+
+    if not clarification_required and should_create_person:
+        if not extracted_email and normalized_scan_kind == "person":
+            raise HTTPException(status_code=422, detail="Unable to detect email address from scanned person card")
+        if extracted_email:
+            pidp_user_result = await _create_or_find_pidp_user_from_business_card(
+                email=extracted_email,
+                full_name=extracted_person.get("name"),
+            )
+            _append_created_target(
+                "person",
+                target_id=str(pidp_user_result.get("pidp_user_id") or "").strip() or None,
+                target_name=str(extracted_person.get("name") or extracted_email or "").strip() or None,
+            )
+
+    if not clarification_required and created_targets:
+        created_targets = await _summarize_scan_targets_with_openai(
+            ocr_text=ocr_text,
+            created_targets=created_targets,
+            audit_hook=_scan_ai_audit_hook,
+        )
+
+    if created_targets:
+        primary = created_targets[0]
+        created_target_type = str(primary.get("type") or "").strip() or None
+        created_target_id = str(primary.get("id") or "").strip() or None
+        created_target_slug = str(primary.get("slug") or "").strip() or None
+        created_target_name = str(primary.get("name") or "").strip() or None
+
+    submission = BusinessCardSubmission(
+        id=submission_id,
+        submitted_by_user_id=actor_user_id,
+        submitted_by_email=current_user.get("email"),
+        submitted_by_name=current_user.get("name"),
+        image_filename=image.filename,
+        image_content_type=content_type,
+        image_size_bytes=len(image_bytes),
+        image_sha256=image_sha256,
+        image_storage_backend=image_storage_backend or None,
+        image_storage_bucket=image_storage_bucket,
+        image_storage_path=image_storage_path or None,
+        image_storage_error=image_storage_error,
+        ocr_provider=ocr_provider,
+        ocr_text=ocr_text,
+        extracted_name=extracted.get("name"),
+        extracted_title=extracted.get("title"),
+        extracted_company=extracted.get("company"),
+        extracted_email=extracted_email or None,
+        extracted_phone=extracted.get("phone"),
+        extracted_website=extracted.get("website"),
+        extracted_address=extracted.get("address"),
+        extracted_metadata={
+            "raw_lines": extracted.get("raw_lines") or [],
+            "links": extracted_event.get("links") if isinstance(extracted_event.get("links"), list) else [],
+            "events_detected": [
+                {
+                    "title": str(item.get("title") or "").strip() or None,
+                    "starts_at": item.get("starts_at").isoformat() if isinstance(item.get("starts_at"), datetime) else None,
+                    "location": str(item.get("location") or "").strip() or None,
+                    "website": str(item.get("website") or "").strip() or None,
+                }
+                for item in extracted_events
+            ],
+            "scan_kind_requested": normalized_scan_kind,
+            "scan_kind_detected": detected_scan_kind,
+            "scan_kind": effective_scan_kind,
+            "processing_status": processing_status,
+            "clarification_required": clarification_required,
+            "clarification_message": clarification_message,
+            "classification_scores": classification_scores,
+            "classification_top_confidence": top_confidence,
+            "classification_confidence_margin": confidence_margin,
+            "auto_min_confidence": auto_min_confidence,
+            "auto_min_margin": auto_min_margin,
+            "created_target_type": created_target_type,
+            "created_target_id": created_target_id,
+            "created_target_slug": created_target_slug,
+            "created_target_name": created_target_name,
+            "created_targets": created_targets,
+            "event_starts_at": extracted.get("starts_at"),
+            "event_link_enrichment_enabled": event_link_enrichment_enabled,
+            "auto_clarification_enabled": auto_clarification_enabled,
+            "event_link_enrichment": event_link_enrichment,
+            "ai_audit_steps": ai_audit_steps,
+        },
+        notes=(notes or "").strip() or None,
+        pidp_user_created=bool(pidp_user_result.get("created")),
+        pidp_user_id=pidp_user_result.get("pidp_user_id"),
+        notification_email_sent=False,
+    )
+    session.add(submission)
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="business_card.submitted",
+        target_type="business_card_submission",
+        target_id=str(submission.id),
+        metadata={
+            "scan_kind_requested": normalized_scan_kind,
+            "scan_kind_detected": detected_scan_kind,
+            "scan_kind": effective_scan_kind,
+            "processing_status": processing_status,
+            "clarification_required": clarification_required,
+            "classification_top_confidence": top_confidence,
+            "classification_confidence_margin": confidence_margin,
+            "created_target_type": created_target_type,
+            "created_target_id": created_target_id,
+            "created_targets_count": len(created_targets),
+            "extracted_email": submission.extracted_email,
+            "pidp_user_created": submission.pidp_user_created,
+            "ocr_provider": submission.ocr_provider,
+            "event_link_enrichment_enabled": event_link_enrichment_enabled,
+            "ai_call_count": len(ai_audit_steps),
+        },
+    )
+    session.commit()
+    session.refresh(submission)
+
+    if not clarification_required and effective_scan_kind == "person" and extracted_email:
+        background_tasks.add_task(
+            _send_business_card_email_task,
+            submission.id,
+            extracted_email,
+            submission.extracted_name,
+            submission.submitted_by_name,
+        )
+    return submission
+
+
+@app.get("/api/network/scans", response_model=List[BusinessCardSubmissionResponse])
+@app.get("/api/network/business-cards", response_model=List[BusinessCardSubmissionResponse])
+async def list_my_business_card_submissions(
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+    limit: int = 100,
+    offset: int = 0,
+):
+    _require_authenticated_user(current_user)
+    actor_user_id = _actor_user_id(current_user)
+    if not actor_user_id:
+        return []
+    safe_limit = max(1, min(limit, 1000))
+    safe_offset = max(0, min(offset, 100000))
+    rows = (
+        session.query(BusinessCardSubmission)
+        .filter(BusinessCardSubmission.submitted_by_user_id == actor_user_id)
+        .order_by(BusinessCardSubmission.created_at.desc(), BusinessCardSubmission.id.desc())
+        .offset(safe_offset)
+        .limit(safe_limit)
+        .all()
+    )
+    return rows
+
+
+@app.get("/api/network/scans/{submission_id}/image")
+@app.get("/api/network/business-cards/{submission_id}/image")
+async def get_my_business_card_submission_image(
+    submission_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    actor_user_id = _actor_user_id(current_user)
+    submission = (
+        session.query(BusinessCardSubmission)
+        .filter(BusinessCardSubmission.id == submission_id)
+        .first()
+    )
+    if not submission:
+        raise HTTPException(status_code=404, detail="Business card submission not found")
+    if submission.submitted_by_user_id != actor_user_id and not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="Not authorized to view this scan image")
+    if not submission.image_storage_path:
+        raise HTTPException(status_code=404, detail="Stored image not available")
+
+    download_name = (submission.image_filename or f"{submission.id}").strip() or f"{submission.id}"
+    image_bytes = _load_business_card_image_bytes(
+        storage_backend=(submission.image_storage_backend or "local"),
+        storage_bucket=submission.image_storage_bucket,
+        storage_path=submission.image_storage_path,
+    )
+    return Response(
+        content=image_bytes,
+        media_type=submission.image_content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'inline; filename="{download_name}"',
+            "Cache-Control": "private, max-age=0, no-cache, no-store",
+        },
+    )
+
+
+@app.get("/api/network/scans/{submission_id}/image/public/{target_type}/{target_id}")
+async def get_public_scan_image_for_created_target(
+    submission_id: uuid.UUID,
+    target_type: str,
+    target_id: str,
+    session: Session = Depends(get_db),
+):
+    normalized_type = str(target_type or "").strip().lower()
+    normalized_target_id = str(target_id or "").strip()
+    if normalized_type not in {"organization", "event"} or not normalized_target_id:
+        raise HTTPException(status_code=404, detail="Scan image not found")
+
+    submission = (
+        session.query(BusinessCardSubmission)
+        .filter(BusinessCardSubmission.id == submission_id)
+        .first()
+    )
+    if not submission or not submission.image_storage_path:
+        raise HTTPException(status_code=404, detail="Scan image not found")
+
+    allowed = False
+    for target in submission.created_targets:
+        if not isinstance(target, dict):
+            continue
+        if str(target.get("type") or "").strip().lower() != normalized_type:
+            continue
+        if str(target.get("id") or "").strip() != normalized_target_id:
+            continue
+        allowed = True
+        break
+    if not allowed:
+        raise HTTPException(status_code=404, detail="Scan image not found")
+
+    image_bytes = _load_business_card_image_bytes(
+        storage_backend=(submission.image_storage_backend or "local"),
+        storage_bucket=submission.image_storage_bucket,
+        storage_path=submission.image_storage_path,
+    )
+    return Response(
+        content=image_bytes,
+        media_type=submission.image_content_type or "application/octet-stream",
+        headers={
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
+
+
+@app.post("/api/network/chat/bootstrap", response_model=MatrixBootstrapSessionResponse)
+async def bootstrap_chat_session(
+    current_user: dict = Depends(get_current_user),
+):
+    _require_authenticated_user(current_user)
+    return await _bootstrap_matrix_session_for_current_user(current_user)
+
+
+@app.get("/api/network/chat/rooms", response_model=List[OrgChatRoomDirectoryItemResponse])
+async def list_org_chat_rooms_for_current_user(
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user)
+    if not user_id:
+        return []
+
+    status_by_org_id: dict[uuid.UUID, str] = {}
+
+    attendee_rows = (
+        session.query(NetworkEvent.host_org_id)
+        .join(EventAttendance, EventAttendance.event_id == NetworkEvent.id)
+        .filter(
+            EventAttendance.user_id == user_id,
+            NetworkEvent.host_org_id.isnot(None),
+        )
+        .distinct()
+        .all()
+    )
+    for (org_id,) in attendee_rows:
+        if not org_id:
+            continue
+        status_by_org_id[org_id] = "attendee"
+
+    member_rows = (
+        session.query(OrganizationMembership.organization_id, OrganizationMembership.role)
+        .filter(OrganizationMembership.user_id == user_id)
+        .all()
+    )
+    for org_id, role in member_rows:
+        if not org_id:
+            continue
+        normalized_role = str(role or "").strip().lower()
+        existing = status_by_org_id.get(org_id)
+        if normalized_role == "admin":
+            status_by_org_id[org_id] = "admin"
+        elif existing != "admin":
+            status_by_org_id[org_id] = "member"
+
+    claimed_rows = (
+        session.query(Organization.id)
+        .filter(Organization.claimed_by_user_id == user_id)
+        .all()
+    )
+    for (org_id,) in claimed_rows:
+        if not org_id:
+            continue
+        status_by_org_id[org_id] = "admin"
+
+    if not status_by_org_id:
+        return []
+
+    org_ids = list(status_by_org_id.keys())
+    organizations = (
+        session.query(Organization.id, Organization.name, Organization.slug)
+        .filter(Organization.id.in_(org_ids))
+        .all()
+    )
+
+    timeout = httpx.Timeout(connect=8.0, read=8.0, write=8.0, pool=8.0)
+    response_items: list[OrgChatRoomDirectoryItemResponse] = []
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for org in organizations:
+            relationship_status = status_by_org_id.get(org.id, "attendee")
+            room_id, room_alias = await _resolve_org_public_chat_room(client, org.slug)
+            room_name: Optional[str] = org.name
+            if not room_id:
+                room_id, discovered_alias, discovered_name = await _matrix_find_public_room_for_org(
+                    client=client,
+                    org_name=org.name,
+                    org_slug=org.slug,
+                )
+                if discovered_alias:
+                    room_alias = discovered_alias
+                if discovered_name:
+                    room_name = discovered_name
+            if (
+                not room_id
+                and ORG_MATRIX_AUTO_PROVISION_PUBLIC_ORG_ROOMS
+                and relationship_status in {"member", "admin"}
+            ):
+                try:
+                    provisioned_room_id, provisioned_alias, provisioned_name = await _matrix_create_public_org_room(
+                        client=client,
+                        org_name=org.name,
+                        org_slug=org.slug,
+                    )
+                    if provisioned_room_id:
+                        room_id = provisioned_room_id
+                        room_alias = provisioned_alias
+                        if provisioned_name:
+                            room_name = provisioned_name
+                except Exception as exc:
+                    logger.warning("Matrix room auto-provision skipped for org_slug=%s error=%s", org.slug, exc)
+            if not room_id:
+                continue
+            response_items.append(
+                OrgChatRoomDirectoryItemResponse(
+                    organization_id=org.id,
+                    organization_name=org.name,
+                    organization_slug=org.slug,
+                    relationship_status=relationship_status,
+                    room_id=room_id,
+                    room_alias=room_alias,
+                    room_name=room_name,
+                )
+            )
+
+    status_priority = {"admin": 0, "member": 1, "attendee": 2}
+    response_items.sort(
+        key=lambda item: (
+            status_priority.get(item.relationship_status, 99),
+            item.organization_name.lower(),
+        )
+    )
+    return response_items
+
+
+@app.get("/api/network/chat/link-preview", response_model=ChatLinkPreviewResponse)
+async def get_chat_link_preview(
+    request: Request,
+    url: str = Query(..., min_length=5, max_length=2048),
+    current_user: dict = Depends(get_current_user),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user) or "unknown"
+    _throttle_action(f"network:chat-link-preview:user:{user_id}", limit=120, window_seconds=3600)
+    _throttle_action(f"network:chat-link-preview:ip:{_request_client_ip(request)}", limit=300, window_seconds=3600)
+    return await _fetch_chat_link_preview(url)
 
 
 @app.get("/api/network/orgs/{organization_id}/members", response_model=List[OrganizationMembershipResponse])
@@ -3909,8 +7656,8 @@ async def list_claim_requests_queue(
     limit: int = 200,
 ):
     _require_authenticated_user(current_user)
-    if not current_user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Admin privileges required")
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
 
     normalized_status = (status_filter or "pending").strip().lower()
     if normalized_status not in {"pending", "approved", "rejected", "all"}:
@@ -4050,17 +7797,19 @@ async def list_network_audit_events(
     current_user: dict = Depends(get_current_user),
     session: Session = Depends(get_db),
     limit: int = 200,
+    event_type_prefix: Optional[str] = None,
+    target_type: Optional[str] = None,
 ):
     _require_authenticated_user(current_user)
-    if not current_user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Admin privileges required")
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
     safe_limit = max(1, min(limit, 2000))
-    rows = (
-        session.query(NetworkAuditEvent)
-        .order_by(NetworkAuditEvent.created_at.desc())
-        .limit(safe_limit)
-        .all()
-    )
+    query = session.query(NetworkAuditEvent)
+    if event_type_prefix:
+        query = query.filter(NetworkAuditEvent.event_type.ilike(f"{event_type_prefix.strip()}%"))
+    if target_type:
+        query = query.filter(NetworkAuditEvent.target_type == target_type.strip())
+    rows = query.order_by(NetworkAuditEvent.created_at.desc()).limit(safe_limit).all()
     return [
         {
             "id": str(row.id),
@@ -4105,7 +7854,11 @@ def _map_contact(contact: UserContactPage, request: Optional[Request]) -> Contac
         email_public=contact.email_public,
         phone_public=contact.phone_public,
         linkedin_url=contact.linkedin_url,
+        github_url=contact.github_url,
+        x_url=contact.x_url,
         website_url=contact.website_url,
+        source_profile_url=contact.source_profile_url,
+        source_profile_imported_at=contact.source_profile_imported_at,
         links=links,
         public_url=public_url,
         updated_at=contact.updated_at,
@@ -4144,6 +7897,8 @@ def _map_public_user_profile(contact: UserContactPage, request: Optional[Request
         email_public=contact.email_public,
         phone_public=contact.phone_public,
         linkedin_url=contact.linkedin_url,
+        github_url=contact.github_url,
+        x_url=contact.x_url,
         website_url=contact.website_url,
         links=links,
         public_url=public_url,
@@ -4230,6 +7985,10 @@ async def update_my_contact_page(
         contact.phone_public = payload.phone_public
     if payload.linkedin_url is not None:
         contact.linkedin_url = _validate_public_url(payload.linkedin_url, "linkedin_url")
+    if payload.github_url is not None:
+        contact.github_url = _validate_public_url(payload.github_url, "github_url")
+    if payload.x_url is not None:
+        contact.x_url = _validate_public_url(payload.x_url, "x_url")
     if payload.website_url is not None:
         contact.website_url = _validate_public_url(payload.website_url, "website_url")
     if payload.links is not None:
@@ -4257,6 +8016,62 @@ async def update_my_contact_page(
     session.commit()
     session.refresh(contact)
     return _map_contact(contact, request)
+
+
+@app.post("/api/network/contact/me/import", response_model=ContactImportResponse)
+async def import_my_contact_page(
+    payload: ContactImportPayload,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    _require_authenticated_user(current_user)
+    user_id = _actor_user_id(current_user)
+    _throttle_action(f"network:contact-import:{user_id}", limit=30, window_seconds=3600)
+
+    safe_source_url = _ensure_public_fetch_url(payload.source_url, "source_url")
+    imported = _fetch_public_profile_import(safe_source_url)
+
+    contact = session.query(UserContactPage).filter(UserContactPage.user_id == user_id).first()
+    if not contact:
+        slug = _ensure_unique_contact_slug(session, _default_contact_slug(current_user))
+        contact = UserContactPage(
+            id=uuid.uuid4(),
+            user_id=user_id,
+            user_email=current_user.get("email"),
+            user_name=current_user.get("name"),
+            slug=slug,
+            enabled=False,
+            links=[],
+        )
+        session.add(contact)
+
+    changed_fields = _apply_contact_import_to_record(contact, imported, payload.overwrite)
+    contact.source_profile_url = safe_source_url
+    contact.source_profile_imported_at = datetime.now(timezone.utc)
+    contact.user_email = current_user.get("email")
+    contact.user_name = current_user.get("name")
+    contact.updated_at = datetime.now(timezone.utc)
+
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="contact_page.imported",
+        target_type="user_contact_page",
+        target_id=user_id,
+        metadata={
+            "source_url": safe_source_url,
+            "overwrite": bool(payload.overwrite),
+            "changed_fields": changed_fields,
+        },
+    )
+    session.commit()
+    session.refresh(contact)
+    return ContactImportResponse(
+        contact=_map_contact(contact, request),
+        imported_fields=changed_fields,
+        source_url=safe_source_url,
+    )
 
 
 @app.get("/api/network/contact/{slug}", response_model=ContactPageResponse)
@@ -4378,6 +8193,58 @@ async def list_public_user_events(
     events = query.offset(safe_offset).limit(safe_limit).all()
     return [_map_network_event(event, None, session) for event in events]
 
+
+@app.get("/api/network/users", response_model=List[NetworkUserListItemResponse])
+async def list_network_users(
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+    q: str = "",
+    limit: int = 300,
+    offset: int = 0,
+    sort: str = Query("recent", pattern="^(recent|name)$"),
+):
+    _require_authenticated_user(current_user)
+    safe_limit = max(1, min(limit, 1000))
+    safe_offset = max(0, min(offset, 100000))
+
+    query = session.query(Account).filter(Account.entity_type == EntityType.INDIVIDUAL)
+    if q.strip():
+        needle = f"%{q.strip()}%"
+        query = query.filter(
+            (Account.name.ilike(needle))
+            | (Account.email.ilike(needle))
+        )
+
+    if sort == "name":
+        query = query.order_by(Account.name.asc(), Account.created_at.desc())
+    else:
+        query = query.order_by(Account.created_at.desc(), Account.name.asc())
+
+    users = query.offset(safe_offset).limit(safe_limit).all()
+    user_ids = [str(user.id) for user in users]
+    contacts = (
+        session.query(UserContactPage)
+        .filter(UserContactPage.user_id.in_(user_ids))
+        .all()
+        if user_ids
+        else []
+    )
+    contact_by_user_id = {str(contact.user_id): contact for contact in contacts}
+
+    return [
+        NetworkUserListItemResponse(
+            user_id=str(user.id),
+            user_name=user.name,
+            email=user.email,
+            created_at=user.created_at,
+            contact_slug=(contact_by_user_id.get(str(user.id)).slug if contact_by_user_id.get(str(user.id)) else None),
+            contact_enabled=bool(contact_by_user_id.get(str(user.id)).enabled) if contact_by_user_id.get(str(user.id)) else False,
+            headline=contact_by_user_id.get(str(user.id)).headline if contact_by_user_id.get(str(user.id)) else None,
+            photo_url=contact_by_user_id.get(str(user.id)).photo_url if contact_by_user_id.get(str(user.id)) else None,
+        )
+        for user in users
+    ]
+
 # ============= ACCOUNT ENDPOINTS =============
 
 @app.post("/api/accounts", response_model=AccountResponse)
@@ -4394,7 +8261,7 @@ async def create_account(
     # Generate tax ID for businesses/nonprofits
     tax_id = None
     if account_data.entity_type in [EntityType.BUSINESS, EntityType.NONPROFIT]:
-        tax_id = f"TX{hashlib.md5(account_data.email.encode()).hexdigest()[:10].upper()}"
+        tax_id = f"TX{secrets.token_hex(5).upper()}"
     
     # Create account
     account = Account(
@@ -4525,12 +8392,25 @@ async def list_accounts(
 
     return query.limit(safe_limit).all()
 
+
+@app.get("/api/authz/me", response_model=AccessClassSnapshotResponse)
+async def get_access_class_snapshot(
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    """Resolve constitutional access classes for the current user."""
+    if current_user.get("is_anonymous"):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return _resolve_access_classes(session, current_user)
+
+
 @app.get("/admin/me")
 async def get_admin_status(current_user: dict = Depends(get_current_user)):
-    """Check if current user is an admin."""
+    """Check if current user is a platform sysadmin."""
     if current_user.get("is_anonymous"):
-        return {"is_admin": False}
-    return {"is_admin": current_user.get("is_admin", False)}
+        return {"is_sysadmin": False}
+    is_sysadmin = _is_sysadmin(current_user)
+    return {"is_sysadmin": is_sysadmin}
 
 @app.get("/api/admin/accounts", response_model=List[AccountListItemResponse])
 async def list_admin_accounts(
@@ -4538,23 +8418,36 @@ async def list_admin_accounts(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     session: Session = Depends(get_db),
 ):
-    """List admin accounts by resolving PIDP users and SpiceDB admin membership."""
+    """List sysadmin accounts by resolving PIDP users and SpiceDB admin membership."""
     if current_user.get("is_anonymous"):
         raise HTTPException(status_code=401, detail="Authentication required")
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
     if not credentials:
         raise HTTPException(status_code=401, detail="Authentication required")
 
     token = credentials.credentials
+    candidate_emails: set[str] = set(ORG_SYSADMIN_EMAILS)
+    current_email = str(current_user.get("email") or "").strip().lower()
+    if current_email:
+        candidate_emails.add(current_email)
+    if not candidate_emails:
+        return []
+
+    pidp_users: list[dict[str, Any]] = []
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{PIDP_BASE_URL}/auth/users",
-                params={"email": "%"},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        if not resp.is_success:
-            raise HTTPException(status_code=resp.status_code, detail="Unable to resolve PIDP users")
-        pidp_users = resp.json() if isinstance(resp.json(), list) else []
+            for email in sorted(candidate_emails):
+                resp = await client.get(
+                    f"{PIDP_BASE_URL}/auth/users",
+                    params={"email": email},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if not resp.is_success:
+                    raise HTTPException(status_code=resp.status_code, detail="Unable to resolve PIDP users")
+                response_payload = resp.json()
+                if isinstance(response_payload, list):
+                    pidp_users.extend(response_payload)
     except HTTPException:
         raise
     except Exception as exc:
@@ -4567,8 +8460,8 @@ async def list_admin_accounts(
         email = str(pidp_user.get("email") or "").strip().lower()
         if not pidp_id or not email:
             continue
-        is_admin = pidp_id in ORG_ADMIN_USER_IDS or await _spicedb_check_admin(pidp_id)
-        if is_admin:
+        is_sysadmin = pidp_id in ORG_SYSADMIN_USER_IDS or await _spicedb_check_sysadmin(pidp_id)
+        if is_sysadmin:
             admin_emails.add(email)
 
     if not admin_emails:
@@ -4875,10 +8768,10 @@ async def update_ubi_settings(
     """Update runtime UBI settings used by the UBI worker."""
     if current_user.get("is_anonymous"):
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not current_user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin access required")
 
-    updates = payload.dict(exclude_unset=True)
+    updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return await get_ubi_runtime_settings()
 
@@ -4912,6 +8805,138 @@ async def update_ubi_settings(
         logger.error(f"Failed to update UBI settings: {exc}")
         raise HTTPException(status_code=503, detail="UBI settings service temporarily unavailable")
     return await get_ubi_runtime_settings()
+
+
+@app.get("/api/admin/business-card/settings", response_model=BusinessCardAbuseSettingsResponse)
+async def get_business_card_abuse_settings(
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user.get("is_anonymous"):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin access required")
+    return await get_business_card_runtime_settings()
+
+
+@app.patch("/api/admin/business-card/settings", response_model=BusinessCardAbuseSettingsResponse)
+async def update_business_card_abuse_settings(
+    payload: BusinessCardAbuseSettingsUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user.get("is_anonymous"):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin access required")
+
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        return await get_business_card_runtime_settings()
+
+    allowed_content_types = updates.get("allowed_content_types")
+    allowed_content_types_csv = ",".join(allowed_content_types) if allowed_content_types is not None else None
+    try:
+        await ensure_business_card_runtime_settings_table()
+        async with db.async_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE business_card_runtime_settings
+                SET enabled = COALESCE($1, enabled),
+                    per_user_limit_per_hour = COALESCE($2, per_user_limit_per_hour),
+                    per_ip_limit_per_hour = COALESCE($3, per_ip_limit_per_hour),
+                    global_limit_per_hour = COALESCE($4, global_limit_per_hour),
+                    duplicate_hash_limit = COALESCE($5, duplicate_hash_limit),
+                    duplicate_hash_window_seconds = COALESCE($6, duplicate_hash_window_seconds),
+                    max_bytes = COALESCE($7, max_bytes),
+                    allowed_content_types = COALESCE($8, allowed_content_types),
+                    event_link_enrichment_enabled = COALESCE($9, event_link_enrichment_enabled),
+                    auto_clarification_enabled = COALESCE($10, auto_clarification_enabled),
+                    auto_min_confidence = COALESCE($11, auto_min_confidence),
+                    auto_min_margin = COALESCE($12, auto_min_margin),
+                    updated_at = NOW(),
+                    updated_by = $13
+                WHERE id = 1
+                """,
+                updates.get("enabled"),
+                updates.get("per_user_limit_per_hour"),
+                updates.get("per_ip_limit_per_hour"),
+                updates.get("global_limit_per_hour"),
+                updates.get("duplicate_hash_limit"),
+                updates.get("duplicate_hash_window_seconds"),
+                updates.get("max_bytes"),
+                allowed_content_types_csv,
+                updates.get("event_link_enrichment_enabled"),
+                updates.get("auto_clarification_enabled"),
+                updates.get("auto_min_confidence"),
+                updates.get("auto_min_margin"),
+                current_user.get("email"),
+            )
+    except Exception as exc:
+        logger.error(f"Failed to update business card abuse settings: {exc}")
+        raise HTTPException(status_code=503, detail="Business card settings service temporarily unavailable")
+    return await get_business_card_runtime_settings()
+
+
+@app.get("/api/admin/scans/{submission_id}/image")
+@app.get("/api/admin/business-cards/{submission_id}/image")
+async def get_business_card_submission_image(
+    submission_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    if current_user.get("is_anonymous"):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin access required")
+
+    submission = (
+        session.query(BusinessCardSubmission)
+        .filter(BusinessCardSubmission.id == submission_id)
+        .first()
+    )
+    if not submission:
+        raise HTTPException(status_code=404, detail="Business card submission not found")
+    if not submission.image_storage_path:
+        raise HTTPException(status_code=404, detail="Stored image not available")
+
+    download_name = (submission.image_filename or f"{submission.id}").strip() or f"{submission.id}"
+    image_bytes = _load_business_card_image_bytes(
+        storage_backend=(submission.image_storage_backend or "local"),
+        storage_bucket=submission.image_storage_bucket,
+        storage_path=submission.image_storage_path,
+    )
+    return Response(
+        content=image_bytes,
+        media_type=submission.image_content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'inline; filename="{download_name}"',
+            "Cache-Control": "private, max-age=0, no-cache, no-store",
+        },
+    )
+
+
+@app.get("/api/admin/scans", response_model=List[BusinessCardSubmissionResponse])
+@app.get("/api/admin/business-cards", response_model=List[BusinessCardSubmissionResponse])
+async def list_business_card_submissions(
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+    limit: int = 100,
+    offset: int = 0,
+):
+    if current_user.get("is_anonymous"):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin access required")
+    safe_limit = max(1, min(limit, 1000))
+    safe_offset = max(0, min(offset, 100000))
+    rows = (
+        session.query(BusinessCardSubmission)
+        .order_by(BusinessCardSubmission.created_at.desc(), BusinessCardSubmission.id.desc())
+        .offset(safe_offset)
+        .limit(safe_limit)
+        .all()
+    )
+    return rows
+
 
 async def process_ubi_payment(account_id: uuid.UUID, amount: Decimal):
     """Process UBI payment asynchronously"""
@@ -4985,7 +9010,7 @@ async def create_stock(
         raise HTTPException(status_code=404, detail="Account not found")
     
     # Check if business is verified
-    if not current_user.get("is_admin") and (account.entity_type != EntityType.BUSINESS or not account.is_verified):
+    if not _is_sysadmin(current_user) and (account.entity_type != EntityType.BUSINESS or not account.is_verified):
         raise HTTPException(status_code=403, detail="Only verified businesses can issue stocks")
     
     # Check if ticker symbol already exists
@@ -5857,7 +9882,11 @@ async def list_governance_motions(
         if statuses:
             query = query.filter(GovernanceMotion.status.in_(statuses))
     if type:
-        if type not in {GovernanceMotionType.MAIN.value, GovernanceMotionType.AMENDMENT.value}:
+        if type not in {
+            GovernanceMotionType.MAIN.value,
+            GovernanceMotionType.AMENDMENT.value,
+            GovernanceMotionType.DISSOLUTION.value,
+        }:
             raise HTTPException(status_code=422, detail="Invalid type filter")
         query = query.filter(GovernanceMotion.type == type)
     if parent_motion_id:
@@ -5876,6 +9905,23 @@ async def get_governance_motion(
     return _map_governance_motion(motion)
 
 
+@app.get(
+    "/api/governance/motions/{motion_id}/dissolution-plan",
+    response_model=GovernanceDissolutionPlanResponse,
+)
+async def get_governance_dissolution_plan(
+    motion_id: uuid.UUID,
+    session: Session = Depends(get_db),
+):
+    motion = _get_governance_motion_or_404(session, motion_id)
+    if motion.type != GovernanceMotionType.DISSOLUTION.value:
+        raise HTTPException(status_code=404, detail="No dissolution plan for this motion")
+    plan = _get_dissolution_plan(session, motion.id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Dissolution plan not found")
+    return plan
+
+
 @app.post("/api/governance/motions", response_model=GovernanceMotionResponse)
 async def create_governance_motion(
     payload: GovernanceMotionCreate,
@@ -5888,8 +9934,9 @@ async def create_governance_motion(
 
     if payload.type == GovernanceMotionType.AMENDMENT.value and not payload.parent_motion_id:
         raise HTTPException(status_code=422, detail="parent_motion_id is required for amendments")
-    if payload.type == GovernanceMotionType.MAIN.value and payload.parent_motion_id:
+    if payload.type in {GovernanceMotionType.MAIN.value, GovernanceMotionType.DISSOLUTION.value} and payload.parent_motion_id:
         raise HTTPException(status_code=422, detail="parent_motion_id is only valid for amendments")
+    _validate_dissolution_payload(payload)
 
     if payload.parent_motion_id:
         _get_governance_motion_or_404(session, payload.parent_motion_id)
@@ -5928,6 +9975,17 @@ async def create_governance_motion(
         quorum_required=int(payload.quorum_required),
     )
     session.add(motion)
+    if payload.type == GovernanceMotionType.DISSOLUTION.value:
+        session.add(
+            GovernanceDissolutionPlan(
+                id=uuid.uuid4(),
+                motion_id=motion.id,
+                asset_disposition=(payload.dissolution_asset_disposition or "").strip(),
+                asset_recipient_name=(payload.dissolution_asset_recipient_name or "").strip(),
+                asset_recipient_type=(payload.dissolution_asset_recipient_type or "").strip(),
+                legal_compliance_notes=(payload.dissolution_legal_compliance_notes or "").strip() or None,
+            )
+        )
     _audit_event(
         session,
         actor=current_user,
@@ -5938,6 +9996,7 @@ async def create_governance_motion(
             "motion_type": motion.type,
             "proposer_type": motion.proposer_type,
             "proposer_org_id": str(motion.proposer_org_id) if motion.proposer_org_id else None,
+            "is_dissolution": motion.type == GovernanceMotionType.DISSOLUTION.value,
         },
     )
     session.commit()
@@ -6018,7 +10077,7 @@ async def withdraw_governance_motion(
     _require_authenticated_user(current_user)
     motion = _get_governance_motion_or_404(session, motion_id)
     user_id = _actor_user_id(current_user)
-    if motion.proposer_user_id != user_id and not current_user.get("is_admin"):
+    if motion.proposer_user_id != user_id and not _is_sysadmin(current_user):
         raise HTTPException(status_code=403, detail="Only the proposer or an admin can withdraw this motion")
     if motion.status != GovernanceMotionStatus.PROPOSED.value:
         raise HTTPException(status_code=400, detail="Only proposed motions can be withdrawn")
@@ -6042,6 +10101,13 @@ async def resolve_governance_motion(
         raise HTTPException(status_code=403, detail="Motion management access required")
     if motion.status != GovernanceMotionStatus.VOTING.value:
         raise HTTPException(status_code=400, detail="Motion must be in voting status")
+    if motion.type == GovernanceMotionType.DISSOLUTION.value:
+        plan = _get_dissolution_plan(session, motion.id)
+        if not plan:
+            raise HTTPException(
+                status_code=422,
+                detail="Dissolution motion cannot be resolved without an asset disposition plan",
+            )
     result = _governance_vote_result(motion)
     next_status = GovernanceMotionStatus.PASSED.value if result["passed"] else GovernanceMotionStatus.FAILED.value
     _ensure_governance_transition(motion, next_status)
@@ -6050,6 +10116,48 @@ async def resolve_governance_motion(
     session.commit()
     session.refresh(motion)
     return _map_governance_motion(motion)
+
+
+@app.post(
+    "/api/governance/motions/{motion_id}/execute-dissolution",
+    response_model=GovernanceDissolutionPlanResponse,
+)
+async def execute_governance_dissolution(
+    motion_id: uuid.UUID,
+    payload: GovernanceDissolutionExecuteRequest,
+    current_user: dict = Depends(get_current_user),
+    session: Session = Depends(get_db),
+):
+    """Record execution of a passed dissolution decision and asset disposition action."""
+    _require_authenticated_user(current_user)
+    if not _is_sysadmin(current_user):
+        raise HTTPException(status_code=403, detail="SysAdmin privileges required")
+    motion = _get_governance_motion_or_404(session, motion_id)
+    if motion.type != GovernanceMotionType.DISSOLUTION.value:
+        raise HTTPException(status_code=422, detail="Motion is not a dissolution motion")
+    if motion.status != GovernanceMotionStatus.PASSED.value:
+        raise HTTPException(status_code=422, detail="Dissolution can only be executed after a passed motion")
+    plan = _get_dissolution_plan(session, motion.id)
+    if not plan:
+        raise HTTPException(status_code=422, detail="Missing dissolution asset disposition plan")
+    plan.executed_at = datetime.now(timezone.utc)
+    plan.executed_by_user_id = _actor_user_id(current_user)
+    plan.execution_notes = (payload.execution_notes or "").strip() or None
+    plan.updated_at = datetime.now(timezone.utc)
+    _audit_event(
+        session,
+        actor=current_user,
+        event_type="governance.dissolution.executed",
+        target_type="governance_motion",
+        target_id=str(motion.id),
+        metadata={
+            "asset_recipient_name": plan.asset_recipient_name,
+            "asset_recipient_type": plan.asset_recipient_type,
+        },
+    )
+    session.commit()
+    session.refresh(plan)
+    return plan
 
 
 @app.post("/api/governance/motions/{motion_id}/votes", response_model=GovernanceMotionResponse)
@@ -6229,17 +10337,57 @@ async def get_governance_motion_results(
 
 # ============= STARTUP TASKS =============
 
-@app.on_event("startup")
-async def startup_tasks():
-    """Start background tasks"""
-    # Start stock price updates
-    asyncio.create_task(update_stock_prices())
-    
-    # Start proposal processing
-    asyncio.create_task(check_and_process_proposals())
-    
-    # Create sample data if needed
-    await create_sample_data()
+def _is_worker_role() -> bool:
+    return ORG_RUNTIME_ROLE in {"worker", "all"}
+
+
+def _worker_lock_key() -> str:
+    return f"org:worker:lock:{ORG_SYSADMIN_RESOURCE_ID}"
+
+
+def _try_acquire_worker_lock() -> bool:
+    if not ORG_WORKER_LOCK_ENABLED:
+        return True
+    try:
+        if not db.redis_client:
+            logger.warning("Worker lock requested but Redis is unavailable; skipping worker tasks")
+            return False
+        acquired = bool(
+            db.redis_client.set(
+                _worker_lock_key(),
+                str(uuid.uuid4()),
+                nx=True,
+                ex=ORG_WORKER_LOCK_SECONDS,
+            )
+        )
+        if not acquired:
+            logger.info("Worker lock held by another instance; skipping embedded worker tasks")
+        return acquired
+    except Exception as exc:
+        logger.warning(f"Worker lock check failed; skipping embedded worker tasks: {exc}")
+        return False
+
+
+async def _start_embedded_worker_tasks() -> list[asyncio.Task]:
+    if not _is_worker_role():
+        logger.info("Skipping background jobs for ORG_RUNTIME_ROLE=%s", ORG_RUNTIME_ROLE)
+        return []
+
+    if ORG_ENABLE_SAMPLE_DATA:
+        await create_sample_data()
+
+    if not ORG_ENABLE_BACKGROUND_JOBS:
+        logger.info("Background jobs disabled via ORG_ENABLE_BACKGROUND_JOBS=false")
+        return []
+
+    if not _try_acquire_worker_lock():
+        return []
+
+    logger.info("Starting embedded worker tasks")
+    return [
+        asyncio.create_task(update_stock_prices()),
+        asyncio.create_task(check_and_process_proposals()),
+    ]
 
 async def create_sample_data():
     """Create sample data for demonstration"""
@@ -6319,7 +10467,7 @@ async def health_check():
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Health check failed")
 
 @app.get("/")
 async def root():

@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.env.matrix
+.env.org
+.env.openai
+.env.resend

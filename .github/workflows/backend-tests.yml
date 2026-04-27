@@ -1,0 +1,49 @@
+name: Org Backend Tests
+
+on:
+  pull_request:
+    paths:
+      - "org.py"
+      - "domain/**"
+      - "migrations/**"
+      - "requirements.txt"
+      - "tests/**"
+      - ".github/workflows/backend-tests.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "org.py"
+      - "domain/**"
+      - "migrations/**"
+      - "requirements.txt"
+      - "tests/**"
+      - ".github/workflows/backend-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: pytest -q
+

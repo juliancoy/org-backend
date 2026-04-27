@@ -12,3 +12,6 @@ Adds LinkedIn-style network primitives:
 - `network_audit_events`
 
 Apply this migration before deploying org-backend changes in strict environments where `Base.metadata.create_all` is not used for schema management.
+
+## Ownership
+See `OWNERSHIP.md` for migration ownership boundaries, naming, rollout, and review rules.

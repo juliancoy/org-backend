@@ -11,6 +11,111 @@ container_app_dir = "/app"
 DEFAULT_PROD_IMAGE = "ghcr.io/juliancoy/org-backend:latest"
 DEFAULT_POSTGRES_IMAGE = "postgres:15-alpine"
 DEFAULT_REDIS_IMAGE = "redis:7.2-alpine"
+DEFAULT_SMTP_RELAY_IMAGE = "boky/postfix:latest"
+
+
+def _parse_simple_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists() or not path.is_file():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _apply_resend_defaults() -> None:
+    # Prefer service-local env file when present, then repo-root fallback.
+    env_candidates = [
+        current_dir / ".env.resend",
+        current_dir.parent / ".env.resend",
+    ]
+    file_values: dict[str, str] = {}
+    for candidate in env_candidates:
+        parsed = _parse_simple_env_file(candidate)
+        if parsed:
+            file_values = parsed
+            break
+
+    for key, value in file_values.items():
+        os.environ.setdefault(key, value)
+
+    resend_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not resend_key:
+        return
+
+    # Map a Resend API key into SMTP relay defaults, while honoring explicit env overrides.
+    os.environ.setdefault("ORG_ENABLE_SMTP_RELAY", "true")
+    os.environ.setdefault("ORG_SMTP_RELAYHOST", "smtp.resend.com")
+    os.environ.setdefault("ORG_SMTP_RELAYHOST_PORT", "587")
+    os.environ.setdefault("ORG_SMTP_RELAY_USERNAME", "resend")
+    os.environ.setdefault("ORG_SMTP_RELAY_PASSWORD", resend_key)
+
+
+def _apply_openai_defaults() -> None:
+    # Prefer service-local env file when present, then repo-root fallback.
+    env_candidates = [
+        current_dir / ".env.openai",
+        current_dir.parent / ".env.openai",
+    ]
+    file_values: dict[str, str] = {}
+    for candidate in env_candidates:
+        parsed = _parse_simple_env_file(candidate)
+        if parsed:
+            file_values = parsed
+            break
+
+    for key, value in file_values.items():
+        os.environ.setdefault(key, value)
+
+
+def _apply_matrix_defaults() -> None:
+    # Prefer service-local env file when present, then repo-root fallback.
+    env_candidates = [
+        current_dir / ".env.matrix",
+        current_dir.parent / ".env.matrix",
+    ]
+    file_values: dict[str, str] = {}
+    for candidate in env_candidates:
+        parsed = _parse_simple_env_file(candidate)
+        if parsed:
+            file_values = parsed
+            break
+
+    for key, value in file_values.items():
+        os.environ.setdefault(key, value)
+
+
+def _apply_org_defaults() -> None:
+    # Prefer service-local env file when present, then repo-root fallback.
+    env_candidates = [
+        current_dir / ".env.org",
+        current_dir.parent / ".env.org",
+    ]
+    file_values: dict[str, str] = {}
+    for candidate in env_candidates:
+        parsed = _parse_simple_env_file(candidate)
+        if parsed:
+            file_values = parsed
+            break
+
+    for key, value in file_values.items():
+        os.environ.setdefault(key, value)
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -128,6 +233,7 @@ def _common_env(
     prefix: str,
     postgres_name: str,
     redis_name: str,
+    smtp_name: str,
     frontend_host: str | None,
 ) -> dict:
     db_name = os.getenv("ORG_DB_NAME", "org")
@@ -149,16 +255,33 @@ def _common_env(
         )
     )
 
-    allowed_origins_default = ",".join(
-        [
-            host
-            for host in [
-                frontend_host,
-                os.getenv("ORG_EXTRA_ALLOWED_ORIGIN", "").strip() or None,
-            ]
-            if host
-        ]
+    default_native_origins = (
+        os.getenv("ORG_NATIVE_ALLOWED_ORIGINS")
+        or "capacitor://localhost,http://localhost,http://127.0.0.1,https://localhost"
     )
+    origin_candidates: list[str] = []
+    if frontend_host:
+        if frontend_host.startswith(("http://", "https://", "capacitor://")):
+            origin_candidates.append(frontend_host)
+        else:
+            origin_candidates.append(f"https://{frontend_host}")
+    extra_allowed_origin = os.getenv("ORG_EXTRA_ALLOWED_ORIGIN", "").strip()
+    if extra_allowed_origin:
+        origin_candidates.append(extra_allowed_origin)
+    origin_candidates.extend([item.strip() for item in default_native_origins.split(",") if item.strip()])
+    allowed_origins_default = ",".join(origin_candidates)
+    smtp_relay_enabled = _env_truthy("ORG_ENABLE_SMTP_RELAY", default=True)
+    smtp_default_host = smtp_name if smtp_relay_enabled else ""
+    smtp_starttls_default = "false" if smtp_relay_enabled else "true"
+    business_card_storage_dir = os.getenv(
+        "ORG_BUSINESS_CARD_STORAGE_DIR",
+        "/var/lib/org/business-cards",
+    )
+    business_card_storage_backend = os.getenv(
+        "ORG_BUSINESS_CARD_STORAGE_BACKEND",
+        "s3",
+    )
+
     return {
         "REDIS_HOST": os.getenv("ORG_REDIS_HOST", redis_name),
         "REDIS_PORT": os.getenv("ORG_REDIS_PORT", "6379"),
@@ -171,9 +294,10 @@ def _common_env(
         "COCKROACH_ASYNC_URL": cockroach_async,
         "SPICEDB_HTTP_URL": os.getenv("SPICEDB_HTTP_URL", ""),
         "SPICEDB_PRESHARED_KEY": os.getenv("SPICEDB_PRESHARED_KEY", ""),
-        "ORG_ADMIN_USER_IDS": os.getenv("ORG_ADMIN_USER_IDS", ""),
-        "ORG_ADMIN_GROUP": os.getenv("ORG_ADMIN_GROUP", "admins"),
-        "ORG_RESOURCE_ID": os.getenv("ORG_RESOURCE_ID", "portal"),
+        "ORG_SYSADMIN_USER_IDS": os.getenv("ORG_SYSADMIN_USER_IDS", ""),
+        "ORG_SYSADMIN_EMAILS": os.getenv("ORG_SYSADMIN_EMAILS", ""),
+        "ORG_SYSADMIN_GROUP": os.getenv("ORG_SYSADMIN_GROUP", "admins"),
+        "ORG_SYSADMIN_RESOURCE_ID": os.getenv("ORG_SYSADMIN_RESOURCE_ID", "portal"),
         "MODERATOR_EMAILS": os.getenv("MODERATOR_EMAILS", ""),
         "ENCRYPTION_KEY": os.getenv("ORG_ENCRYPTION_KEY", "temporary-key-please-change"),
         "ALLOWED_ORIGINS": os.getenv("ALLOWED_ORIGINS", allowed_origins_default),
@@ -192,11 +316,75 @@ def _common_env(
             "ORG_PUBLIC_CALENDAR_PULL_ENABLED",
             "true",
         ),
+        "ORG_MATRIX_HOMESERVER_URL": os.getenv("ORG_MATRIX_HOMESERVER_URL", "http://synapse:8008"),
+        "ORG_MATRIX_SERVER_NAME": os.getenv("ORG_MATRIX_SERVER_NAME", "matrix.arkavo.org"),
+        "ORG_MATRIX_ADMIN_TOKEN": os.getenv("ORG_MATRIX_ADMIN_TOKEN", ""),
+        "ORG_MATRIX_PASSWORD_SECRET": os.getenv("ORG_MATRIX_PASSWORD_SECRET", ""),
+        "ORG_MATRIX_AUTO_PROVISION_PUBLIC_ORG_ROOMS": os.getenv(
+            "ORG_MATRIX_AUTO_PROVISION_PUBLIC_ORG_ROOMS",
+            "true",
+        ),
+        "ORG_ALLOWED_PAT_SCOPES": os.getenv("ORG_ALLOWED_PAT_SCOPES", "org_portal,org_mcp,org_admin"),
+        "ORG_BUSINESS_CARD_MAX_BYTES": os.getenv("ORG_BUSINESS_CARD_MAX_BYTES", str(8 * 1024 * 1024)),
+        "ORG_BUSINESS_CARD_ALLOWED_CONTENT_TYPES": os.getenv(
+            "ORG_BUSINESS_CARD_ALLOWED_CONTENT_TYPES",
+            "image/jpeg,image/png,image/webp",
+        ),
+        "ORG_BUSINESS_CARD_OCR_PROVIDER": os.getenv("ORG_BUSINESS_CARD_OCR_PROVIDER", "openai"),
+        "ORG_BUSINESS_CARD_OCR_MODEL": os.getenv("ORG_BUSINESS_CARD_OCR_MODEL", "gpt-4.1-mini"),
+        "ORG_BUSINESS_CARD_STORAGE_ENABLED": os.getenv("ORG_BUSINESS_CARD_STORAGE_ENABLED", "true"),
+        "ORG_BUSINESS_CARD_STORAGE_BACKEND": business_card_storage_backend,
+        "ORG_BUSINESS_CARD_STORAGE_DIR": business_card_storage_dir,
+        "ORG_BUSINESS_CARD_S3_ENDPOINT_URL": os.getenv(
+            "ORG_BUSINESS_CARD_S3_ENDPOINT_URL",
+            "http://minio:9000",
+        ),
+        "ORG_BUSINESS_CARD_S3_BUCKET": os.getenv(
+            "ORG_BUSINESS_CARD_S3_BUCKET",
+            "org-business-cards",
+        ),
+        "ORG_BUSINESS_CARD_S3_REGION": os.getenv(
+            "ORG_BUSINESS_CARD_S3_REGION",
+            "us-east-1",
+        ),
+        "ORG_BUSINESS_CARD_S3_ACCESS_KEY": os.getenv(
+            "ORG_BUSINESS_CARD_S3_ACCESS_KEY",
+            os.getenv("MINIO_ROOT_USER", "minio"),
+        ),
+        "ORG_BUSINESS_CARD_S3_SECRET_KEY": os.getenv(
+            "ORG_BUSINESS_CARD_S3_SECRET_KEY",
+            os.getenv("MINIO_ROOT_PASSWORD", "changeme"),
+        ),
+        "ORG_BUSINESS_CARD_S3_USE_SSL": os.getenv(
+            "ORG_BUSINESS_CARD_S3_USE_SSL",
+            "false",
+        ),
+        "ORG_BUSINESS_CARD_S3_PREFIX": os.getenv(
+            "ORG_BUSINESS_CARD_S3_PREFIX",
+            "business-cards",
+        ),
+        "ORG_OPENAI_API_KEY": os.getenv("ORG_OPENAI_API_KEY", ""),
+        "ORG_OPENAI_API_BASE_URL": os.getenv("ORG_OPENAI_API_BASE_URL", "https://api.openai.com/v1"),
+        "ORG_SMTP_HOST": os.getenv("ORG_SMTP_HOST", smtp_default_host),
+        "ORG_SMTP_PORT": os.getenv("ORG_SMTP_PORT", "587"),
+        "ORG_SMTP_USERNAME": os.getenv("ORG_SMTP_USERNAME", ""),
+        "ORG_SMTP_PASSWORD": os.getenv("ORG_SMTP_PASSWORD", ""),
+        "ORG_SMTP_FROM": os.getenv("ORG_SMTP_FROM", "noreply@arkavo.org"),
+        "ORG_SMTP_STARTTLS": os.getenv("ORG_SMTP_STARTTLS", smtp_starttls_default),
+        "ORG_PORTAL_BASE_URL": os.getenv("ORG_PORTAL_BASE_URL", ""),
+        "ORG_ENABLE_BACKGROUND_JOBS": os.getenv("ORG_ENABLE_BACKGROUND_JOBS", "true"),
+        "ORG_ENABLE_SAMPLE_DATA": os.getenv("ORG_ENABLE_SAMPLE_DATA", "false"),
+        "ORG_WORKER_LOCK_ENABLED": os.getenv("ORG_WORKER_LOCK_ENABLED", "false"),
+        "ORG_WORKER_LOCK_SECONDS": os.getenv("ORG_WORKER_LOCK_SECONDS", "300"),
         "WATCHFILES_FORCE_POLLING": "true",
     }
 
 
 def run(prefix: str, network_name: str) -> None:
+    _apply_org_defaults()
+    _apply_resend_defaults()
+    _apply_openai_defaults()
+    _apply_matrix_defaults()
     docker_utils.ensure_network(network_name)
 
     prod_base = os.getenv("ORG_PROD_PUBLIC_BASE_URL")
@@ -206,11 +394,18 @@ def run(prefix: str, network_name: str) -> None:
 
     postgres_name = prefix + "orgdb"
     redis_name = prefix + "org-redis"
+    smtp_name = prefix + "org-smtp-relay"
     prod_name = prefix + "org"
     dev_name = prefix + "org-dev"
+    worker_name = prefix + "org-worker"
+    business_card_storage_dir = os.getenv(
+        "ORG_BUSINESS_CARD_STORAGE_DIR",
+        "/var/lib/org/business-cards",
+    )
+    business_card_storage_volume = prefix + "ORG_BUSINESS_CARD_STORAGE"
 
-    env_base_prod = _common_env(prefix, postgres_name, redis_name, prod_frontend_host)
-    env_base_dev = _common_env(prefix, postgres_name, redis_name, dev_frontend_host)
+    env_base_prod = _common_env(prefix, postgres_name, redis_name, smtp_name, prod_frontend_host)
+    env_base_dev = _common_env(prefix, postgres_name, redis_name, smtp_name, dev_frontend_host)
 
     db_name = os.getenv("ORG_DB_NAME", "org")
     db_user = os.getenv("ORG_DB_USER", "org")
@@ -250,13 +445,39 @@ def run(prefix: str, network_name: str) -> None:
         "command": ["redis-server", "--appendonly", "yes"],
     }
 
+    smtp_relay_enabled = _env_truthy("ORG_ENABLE_SMTP_RELAY", default=True)
+    relayhost = os.getenv("ORG_SMTP_RELAYHOST", "").strip()
+    relayhost_port = os.getenv("ORG_SMTP_RELAYHOST_PORT", "587").strip()
+    relayhost_target = f"{relayhost}:{relayhost_port}" if relayhost else ""
+    smtp_relay = {
+        "image": os.getenv("ORG_SMTP_RELAY_IMAGE", DEFAULT_SMTP_RELAY_IMAGE),
+        "detach": True,
+        "name": smtp_name,
+        "network": network_name,
+        "restart_policy": {"Name": "always"},
+        "environment": {
+            "HOSTNAME": os.getenv("ORG_SMTP_HOSTNAME", "org-smtp-relay.local"),
+            "ALLOWED_SENDER_DOMAINS": os.getenv("ORG_SMTP_ALLOWED_SENDER_DOMAINS", "arkavo.org"),
+            "RELAYHOST": relayhost_target,
+            "RELAYHOST_USERNAME": os.getenv("ORG_SMTP_RELAY_USERNAME", ""),
+            "RELAYHOST_PASSWORD": os.getenv("ORG_SMTP_RELAY_PASSWORD", ""),
+        },
+    }
+
     prod_image = _resolve_prod_image()
     prod = {
         "image": prod_image,
         "name": prod_name,
+        "volumes": {
+            business_card_storage_volume: {
+                "bind": business_card_storage_dir,
+                "mode": "rw",
+            },
+        },
         "environment": {
             **env_base_prod,
             "BACKEND_IMAGE_RUNNING": prod_image,
+            "ORG_RUNTIME_ROLE": "api",
         },
         "network": network_name,
         "restart_policy": {"Name": "always"},
@@ -276,10 +497,17 @@ def run(prefix: str, network_name: str) -> None:
     dev = {
         "image": dev_image,
         "name": dev_name,
-        "volumes": {str(current_dir): {"bind": container_app_dir, "mode": "rw"}},
+        "volumes": {
+            str(current_dir): {"bind": container_app_dir, "mode": "rw"},
+            business_card_storage_volume: {
+                "bind": business_card_storage_dir,
+                "mode": "rw",
+            },
+        },
         "environment": {
             **env_base_dev,
             "BACKEND_IMAGE_RUNNING": "dev-local-build",
+            "ORG_RUNTIME_ROLE": "api",
         },
         "network": network_name,
         "restart_policy": {"Name": "always"},
@@ -291,14 +519,36 @@ def run(prefix: str, network_name: str) -> None:
             "0.0.0.0",
             "--port",
             "8001",
+            "--log-config",
+            "/app/uvicorn_log_config.json",
             "--reload",
             "--reload-dir",
             container_app_dir,
         ],
     }
+    worker = {
+        "image": dev_image,
+        "name": worker_name,
+        "volumes": {
+            str(current_dir): {"bind": container_app_dir, "mode": "rw"},
+            business_card_storage_volume: {
+                "bind": business_card_storage_dir,
+                "mode": "rw",
+            },
+        },
+        "environment": {
+            **env_base_dev,
+            "BACKEND_IMAGE_RUNNING": "dev-local-build-worker",
+            "ORG_RUNTIME_ROLE": "worker",
+        },
+        "network": network_name,
+        "restart_policy": {"Name": "always"},
+        "detach": True,
+        "command": ["python", "worker.py"],
+    }
 
     # Converge to this launcher's configuration even if legacy containers exist.
-    for name in (prod_name, dev_name, postgres_name, redis_name, "port_test"):
+    for name in (prod_name, dev_name, worker_name, postgres_name, redis_name, smtp_name, "port_test"):
         try:
             container = docker_utils.DOCKER_CLIENT.containers.get(name)
             container.stop()
@@ -317,8 +567,12 @@ def run(prefix: str, network_name: str) -> None:
     docker_utils.wait_for_db(network_name, db_url=f"{postgres_name}:5432", db_user=db_user)
     docker_utils.run_container(redis)
     docker_utils.wait_for_port(redis_name, 6379, network_name, retries=60, delay=2)
+    if smtp_relay_enabled:
+        docker_utils.run_container(smtp_relay)
+        docker_utils.wait_for_port(smtp_name, 587, network_name, retries=60, delay=2)
     docker_utils.run_container(prod)
     docker_utils.run_container(dev)
+    docker_utils.run_container(worker)
 
 
 if __name__ == "__main__":

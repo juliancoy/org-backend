@@ -1,5 +1,5 @@
 fastapi
-uvicorn[standard]
+uvicorn[standard]==0.34.2
 redis
 requests
 httpx
@@ -9,3 +9,7 @@ asyncpg
 sqlalchemy
 sqlalchemy-cockroachdb
 psycopg2-binary
+mcp
+boto3
+beautifulsoup4
+pytest
