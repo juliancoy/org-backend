@@ -241,7 +241,7 @@ def _common_env(
     db_user = os.getenv("ORG_DB_USER", "org")
     db_password = os.getenv("ORG_DB_PASSWORD", "orgchange")
     db_port = int(os.getenv("ORG_DB_PORT", "5432"))
-    use_cockroach = _env_truthy("ORG_USE_COCKROACH", default=False)
+    use_cockroach = _env_truthy("ORG_USE_COCKROACH", default=True)
     if use_cockroach:
         cockroach_host = os.getenv("ORG_COCKROACH_HOST", f"{prefix}cockroach")
         cockroach_port = int(os.getenv("ORG_COCKROACH_SQL_PORT", "26257"))
@@ -426,7 +426,7 @@ def run(prefix: str, network_name: str) -> None:
         "/var/lib/org/business-cards",
     )
     business_card_storage_volume = prefix + "ORG_BUSINESS_CARD_STORAGE"
-    use_cockroach = _env_truthy("ORG_USE_COCKROACH", default=False)
+    use_cockroach = _env_truthy("ORG_USE_COCKROACH", default=True)
     cockroach_cert_dir = Path(os.getenv("ORG_COCKROACH_CERT_DIR", str(DEFAULT_COCKROACH_CERT_DIR)))
     cockroach_cert_mount = {
         str(cockroach_cert_dir): {
