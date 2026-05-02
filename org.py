@@ -126,7 +126,7 @@ TREASURY_ACCOUNT_CODE = "central-treasury"
 DEPARTMENT_SEEDS = [
     {
         "code": "peacekeeping-force",
-        "name": "Peacekeeping Force",
+        "name": "Peace",
         "domain": "Security",
         "mandate": "Maintains defensive readiness and civil peacekeeping capacity under democratic fiscal direction.",
     },
@@ -162,7 +162,7 @@ DEPARTMENT_SEEDS = [
     },
     {
         "code": "dept-of-housing",
-        "name": "Dept of Housing",
+        "name": "Housing",
         "domain": "Shelter",
         "mandate": "Operates as the explicit department account target for housing budgets, wage schedules, and housing programs.",
     },
@@ -174,7 +174,7 @@ DEPARTMENT_SEEDS = [
     },
     {
         "code": "department-of-industry",
-        "name": "Department of Industry",
+        "name": "Industry",
         "domain": "Production",
         "mandate": "Coordinates industrial capacity, productive infrastructure, supply chains, and public-interest enterprise development.",
     },
@@ -286,7 +286,7 @@ async def ensure_departments_and_treasury_schema() -> None:
             INSERT INTO accounts
                 (id, entity_type, name, email, balance, credit_score, created_at, updated_at, is_verified)
             VALUES
-                (gen_random_uuid(), 'GOVERNMENT', 'Central Treasury', $1, 0, 850, NOW(), NOW(), true)
+                (gen_random_uuid(), 'GOVERNMENT', 'Treasury', $1, 0, 850, NOW(), NOW(), true)
             ON CONFLICT (email) DO UPDATE SET
                 entity_type = 'GOVERNMENT',
                 name = EXCLUDED.name,
@@ -300,7 +300,7 @@ async def ensure_departments_and_treasury_schema() -> None:
             """
             INSERT INTO treasury_accounts (id, code, name, account_id, purpose, active, created_at, updated_at)
             VALUES (
-                gen_random_uuid(), $1, 'Central Treasury', $2,
+                gen_random_uuid(), $1, 'Treasury', $2,
                 'Receives taxes and funds department allocations.',
                 true, NOW(), NOW()
             )
