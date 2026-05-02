@@ -213,6 +213,17 @@ async def pay_taxes(
 
     try:
         async with conn.transaction():
+            treasury_account_id = await conn.fetchval(
+                """
+                SELECT account_id
+                FROM treasury_accounts
+                WHERE code = 'central-treasury'
+                  AND active = true
+                """
+            )
+            if not treasury_account_id:
+                raise HTTPException(status_code=503, detail="Central treasury account is not configured")
+
             await conn.execute(
                 """
                 UPDATE accounts
@@ -244,19 +255,44 @@ async def pay_taxes(
 
             await conn.execute(
                 """
+                UPDATE accounts
+                SET balance = COALESCE(balance, 0) + $1,
+                    updated_at = NOW()
+                WHERE id = $2
+                """,
+                float(amount),
+                treasury_account_id,
+            )
+
+            await conn.execute(
+                """
                 INSERT INTO transactions
-                (id, from_account_id, amount, transaction_type, description, timestamp)
-                VALUES ($1, $2, $3, $4, $5, NOW())
+                    (id, from_account_id, to_account_id, amount, currency, transaction_type,
+                     description, timestamp, reference_id, metadata)
+                VALUES
+                    ($1, $2, $3, $4, 'DEM', $5, $6, NOW(), $7, $8::jsonb)
                 """,
                 uuid.uuid4(),
                 account.id,
+                treasury_account_id,
                 float(amount),
-                TransactionType.TAX_PAYMENT.value,
+                TransactionType.TAX_PAYMENT.name,
                 f"Tax payment for {tax_record.tax_year}",
+                f"tax:{record_id}",
+                json.dumps(
+                    {
+                        "source": "org-tax-router",
+                        "tax_record_id": str(record_id),
+                        "tax_year": tax_record.tax_year,
+                        "treasury_code": "central-treasury",
+                    }
+                ),
             )
 
         return {"paid": amount, "remaining": tax_record.tax_amount - tax_record.paid_amount - amount}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Tax payment failed: {e}")
         raise HTTPException(status_code=500, detail="Tax payment failed")

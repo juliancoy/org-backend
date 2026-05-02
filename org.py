@@ -121,6 +121,65 @@ db = Database(
 
 DEFAULT_DENA_ANNUAL = Decimal(DEFAULT_DENA_ANNUAL_RAW)
 
+TREASURY_ACCOUNT_EMAIL = "treasury@arkavo.org"
+TREASURY_ACCOUNT_CODE = "central-treasury"
+DEPARTMENT_SEEDS = [
+    {
+        "code": "peacekeeping-force",
+        "name": "Peacekeeping Force",
+        "domain": "Security",
+        "mandate": "Maintains defensive readiness and civil peacekeeping capacity under democratic fiscal direction.",
+    },
+    {
+        "code": "law-enforcement",
+        "name": "Law Enforcement",
+        "domain": "Security",
+        "mandate": "Protects public safety, due process, and community order while remaining accountable to civic oversight.",
+    },
+    {
+        "code": "faith",
+        "name": "Faith",
+        "domain": "Meaning",
+        "mandate": "Supports pluralistic spiritual, ethical, and chaplaincy services without establishing a single creed.",
+    },
+    {
+        "code": "communications",
+        "name": "Communications",
+        "domain": "Coordination",
+        "mandate": "Maintains public communications, emergency messaging, civic media, and reliable information channels.",
+    },
+    {
+        "code": "culture",
+        "name": "Culture",
+        "domain": "Civic Life",
+        "mandate": "Funds arts, heritage, public memory, education-adjacent culture, and shared civic rituals.",
+    },
+    {
+        "code": "housing",
+        "name": "Housing",
+        "domain": "Shelter",
+        "mandate": "Coordinates shelter policy, housing supply, tenant stability, and homelessness prevention.",
+    },
+    {
+        "code": "dept-of-housing",
+        "name": "Dept of Housing",
+        "domain": "Shelter",
+        "mandate": "Operates as the explicit department account target for housing budgets, wage schedules, and housing programs.",
+    },
+    {
+        "code": "energy",
+        "name": "Energy",
+        "domain": "Infrastructure",
+        "mandate": "Plans energy resilience, utility access, generation, distribution, and public-interest infrastructure.",
+    },
+    {
+        "code": "department-of-industry",
+        "name": "Department of Industry",
+        "domain": "Production",
+        "mandate": "Coordinates industrial capacity, productive infrastructure, supply chains, and public-interest enterprise development.",
+    },
+]
+
 
 async def ensure_ubi_runtime_settings_table() -> None:
     entity_csv = ",".join(DEFAULT_UBI_ENTITY_TYPES or ["individual"])
@@ -149,6 +208,151 @@ async def ensure_ubi_runtime_settings_table() -> None:
             DEFAULT_DENA_PRECISION,
             entity_csv,
         )
+
+
+async def ensure_departments_and_treasury_schema() -> None:
+    async with db.async_pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS treasury_accounts (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                code VARCHAR(64) NOT NULL UNIQUE,
+                name VARCHAR(255) NOT NULL,
+                account_id UUID NOT NULL UNIQUE REFERENCES accounts(id) ON DELETE RESTRICT,
+                purpose TEXT,
+                active BOOL NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_treasury_accounts_code ON treasury_accounts (code)")
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS departments (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                code VARCHAR(64) NOT NULL UNIQUE,
+                name VARCHAR(255) NOT NULL,
+                domain VARCHAR(100) NOT NULL,
+                mandate TEXT NOT NULL,
+                account_id UUID NOT NULL UNIQUE REFERENCES accounts(id) ON DELETE RESTRICT,
+                active BOOL NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_departments_code ON departments (code)")
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS department_programs (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                department_id UUID NOT NULL REFERENCES departments(id) ON DELETE CASCADE,
+                code VARCHAR(96) NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                mandate TEXT,
+                account_id UUID REFERENCES accounts(id) ON DELETE SET NULL,
+                active BOOL NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (department_id, code)
+            )
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_department_programs_department_code ON department_programs (department_id, code)"
+        )
+        await conn.execute(
+            """
+            ALTER TABLE budget_allocations
+            ADD COLUMN IF NOT EXISTS department_id UUID REFERENCES departments(id) ON DELETE SET NULL
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE budget_allocations
+            ADD COLUMN IF NOT EXISTS program_id UUID REFERENCES department_programs(id) ON DELETE SET NULL
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE budget_allocations
+            ADD COLUMN IF NOT EXISTS treasury_transaction_id UUID
+            """
+        )
+
+        treasury_account_id = await conn.fetchval(
+            """
+            INSERT INTO accounts
+                (id, entity_type, name, email, balance, credit_score, created_at, updated_at, is_verified)
+            VALUES
+                (gen_random_uuid(), 'GOVERNMENT', 'Central Treasury', $1, 0, 850, NOW(), NOW(), true)
+            ON CONFLICT (email) DO UPDATE SET
+                entity_type = 'GOVERNMENT',
+                name = EXCLUDED.name,
+                is_verified = true,
+                updated_at = NOW()
+            RETURNING id
+            """,
+            TREASURY_ACCOUNT_EMAIL,
+        )
+        await conn.execute(
+            """
+            INSERT INTO treasury_accounts (id, code, name, account_id, purpose, active, created_at, updated_at)
+            VALUES (
+                gen_random_uuid(), $1, 'Central Treasury', $2,
+                'Receives taxes and funds department allocations.',
+                true, NOW(), NOW()
+            )
+            ON CONFLICT (code) DO UPDATE SET
+                name = EXCLUDED.name,
+                account_id = EXCLUDED.account_id,
+                purpose = EXCLUDED.purpose,
+                active = true,
+                updated_at = NOW()
+            """,
+            TREASURY_ACCOUNT_CODE,
+            treasury_account_id,
+        )
+
+        for seed in DEPARTMENT_SEEDS:
+            account_id = await conn.fetchval(
+                """
+                INSERT INTO accounts
+                    (id, entity_type, name, email, balance, credit_score, created_at, updated_at,
+                     mission_statement, is_verified)
+                VALUES
+                    (gen_random_uuid(), 'GOVERNMENT', $1, $2, 0, 850, NOW(), NOW(), $3, true)
+                ON CONFLICT (email) DO UPDATE SET
+                    entity_type = 'GOVERNMENT',
+                    name = EXCLUDED.name,
+                    mission_statement = EXCLUDED.mission_statement,
+                    is_verified = true,
+                    updated_at = NOW()
+                RETURNING id
+                """,
+                seed["name"],
+                f"{seed['code']}@departments.arkavo.org",
+                seed["mandate"],
+            )
+            await conn.execute(
+                """
+                INSERT INTO departments (id, code, name, domain, mandate, account_id, active, created_at, updated_at)
+                VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, true, NOW(), NOW())
+                ON CONFLICT (code) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    domain = EXCLUDED.domain,
+                    mandate = EXCLUDED.mandate,
+                    account_id = EXCLUDED.account_id,
+                    active = true,
+                    updated_at = NOW()
+                """,
+                seed["code"],
+                seed["name"],
+                seed["domain"],
+                seed["mandate"],
+                account_id,
+            )
 
 
 def _default_ubi_runtime_settings() -> dict:
@@ -535,6 +739,7 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Governance dissolution schema migration skipped: {exc}")
     await ensure_ubi_runtime_settings_table()
     await ensure_business_card_runtime_settings_table()
+    await ensure_departments_and_treasury_schema()
     if ORG_BUSINESS_CARD_STORAGE_ENABLED:
         try:
             if _business_card_storage_backend() == "s3":
@@ -1296,6 +1501,7 @@ from api.routers.portfolio import router as portfolio_router
 from api.routers.insurance import router as insurance_router
 from api.routers.fiscal import router as fiscal_router
 from api.routers.governance import router as governance_router
+from api.routers.departments import router as departments_router
 
 app.include_router(network_orgs_router)
 app.include_router(network_events_router)
@@ -1315,6 +1521,7 @@ app.include_router(portfolio_router)
 app.include_router(insurance_router)
 app.include_router(fiscal_router)
 app.include_router(governance_router)
+app.include_router(departments_router)
 
 if __name__ == "__main__":
     import uvicorn

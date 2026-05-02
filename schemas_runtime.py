@@ -901,6 +901,44 @@ class NetworkBotIssueTokenResponse(BaseModel):
     issued_api_token_scope: str
 
 
+class TreasuryAccountResponse(BaseModel):
+    id: uuid.UUID
+    code: str
+    name: str
+    account_id: uuid.UUID
+    balance: Decimal
+    purpose: Optional[str] = None
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class DepartmentResponse(BaseModel):
+    id: uuid.UUID
+    code: str
+    name: str
+    domain: str
+    mandate: str
+    account_id: uuid.UUID
+    balance: Decimal
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class DepartmentProgramResponse(BaseModel):
+    id: uuid.UUID
+    department_id: uuid.UUID
+    code: str
+    name: str
+    mandate: Optional[str] = None
+    account_id: Optional[uuid.UUID] = None
+    balance: Optional[Decimal] = None
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 class ContactImportPayload(BaseModel):
     source_url: str = Field(..., min_length=1, max_length=1000)
     overwrite: bool = True
@@ -910,5 +948,4 @@ class ContactImportResponse(BaseModel):
     contact: ContactPageResponse
     imported_fields: List[str] = Field(default_factory=list)
     source_url: str
-
 

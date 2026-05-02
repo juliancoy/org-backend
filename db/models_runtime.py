@@ -967,3 +967,55 @@ class GovernanceReaction(Base):
 
     motion = relationship("GovernanceMotion", back_populates="reactions")
 
+
+class TreasuryAccount(Base):
+    __tablename__ = "treasury_accounts"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    code = Column(String(64), nullable=False, unique=True, index=True)
+    name = Column(String(255), nullable=False)
+    account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="RESTRICT"), nullable=False, unique=True)
+    purpose = Column(Text)
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+
+    account = relationship("Account")
+
+
+class Department(Base):
+    __tablename__ = "departments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    code = Column(String(64), nullable=False, unique=True, index=True)
+    name = Column(String(255), nullable=False)
+    domain = Column(String(100), nullable=False)
+    mandate = Column(Text, nullable=False)
+    account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="RESTRICT"), nullable=False, unique=True)
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+
+    account = relationship("Account")
+    programs = relationship("DepartmentProgram", back_populates="department")
+
+
+class DepartmentProgram(Base):
+    __tablename__ = "department_programs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    department_id = Column(UUID(as_uuid=True), ForeignKey("departments.id", ondelete="CASCADE"), nullable=False, index=True)
+    code = Column(String(96), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    mandate = Column(Text)
+    account_id = Column(UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="SET NULL"))
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_department_programs_department_code", "department_id", "code", unique=True),
+    )
+
+    department = relationship("Department", back_populates="programs")
+    account = relationship("Account")
