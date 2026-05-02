@@ -121,7 +121,11 @@ ORG_BUSINESS_CARD_S3_BUCKET = os.environ.get("ORG_BUSINESS_CARD_S3_BUCKET", "org
 ORG_BUSINESS_CARD_S3_REGION = os.environ.get("ORG_BUSINESS_CARD_S3_REGION", "us-east-1").strip() or "us-east-1"
 ORG_BUSINESS_CARD_S3_ACCESS_KEY = os.environ.get("ORG_BUSINESS_CARD_S3_ACCESS_KEY", "").strip()
 ORG_BUSINESS_CARD_S3_SECRET_KEY = os.environ.get("ORG_BUSINESS_CARD_S3_SECRET_KEY", "").strip()
-ORG_BUSINESS_CARD_S3_USE_SSL = os.environ.get("ORG_BUSINESS_CARD_S3_USE_SSL", "false").strip().lower() in {"1", "true", "yes", "on"}
+ORG_BUSINESS_CARD_S3_USE_SSL = os.environ.get("ORG_BUSINESS_CARD_S3_USE_SSL", "true").strip().lower() in {"1", "true", "yes", "on"}
+ORG_BUSINESS_CARD_S3_SERVER_SIDE_ENCRYPTION = os.environ.get(
+    "ORG_BUSINESS_CARD_S3_SERVER_SIDE_ENCRYPTION",
+    "AES256",
+).strip()
 ORG_BUSINESS_CARD_S3_PREFIX = os.environ.get("ORG_BUSINESS_CARD_S3_PREFIX", "business-cards").strip().strip("/")
 ORG_BUSINESS_CARD_OCR_PROVIDER = os.environ.get(
     "ORG_BUSINESS_CARD_OCR_PROVIDER",

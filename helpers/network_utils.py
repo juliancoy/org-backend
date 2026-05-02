@@ -810,6 +810,11 @@ def _persist_business_card_image(
             Key=object_key,
             Body=image_bytes,
             ContentType=content_type or "application/octet-stream",
+            **(
+                {"ServerSideEncryption": ORG_BUSINESS_CARD_S3_SERVER_SIDE_ENCRYPTION}
+                if ORG_BUSINESS_CARD_S3_SERVER_SIDE_ENCRYPTION
+                else {}
+            ),
         )
         return ("s3", ORG_BUSINESS_CARD_S3_BUCKET, object_key)
 
