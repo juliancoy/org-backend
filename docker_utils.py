@@ -626,4 +626,3 @@ def check_amd_gpu():
 
 if __name__ == "__main__":
     generateDevKeys('test')
-

@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+# Certificates / private keys
+*.crt
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Generated artifacts
+build/
+dist/
+coverage/
+htmlcov/
+.pytest_cache/
