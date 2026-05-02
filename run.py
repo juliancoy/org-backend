@@ -12,6 +12,7 @@ DEFAULT_PROD_IMAGE = "ghcr.io/juliancoy/org-backend:latest"
 DEFAULT_POSTGRES_IMAGE = "postgres:15-alpine"
 DEFAULT_REDIS_IMAGE = "redis:7.2-alpine"
 DEFAULT_SMTP_RELAY_IMAGE = "boky/postfix:latest"
+DEFAULT_COCKROACH_CERT_DIR = current_dir.parent / "OrgPortal" / "certs" / "cockroach"
 
 
 def _parse_simple_env_file(path: Path) -> dict[str, str]:
@@ -240,20 +241,41 @@ def _common_env(
     db_user = os.getenv("ORG_DB_USER", "org")
     db_password = os.getenv("ORG_DB_PASSWORD", "orgchange")
     db_port = int(os.getenv("ORG_DB_PORT", "5432"))
-    cockroach_sync = (
-        os.getenv("COCKROACH_DB_URL")
-        or (
-            f"postgresql+psycopg2://{db_user}:{db_password}"
-            f"@{postgres_name}:{db_port}/{db_name}"
+    use_cockroach = _env_truthy("ORG_USE_COCKROACH", default=False)
+    if use_cockroach:
+        cockroach_host = os.getenv("ORG_COCKROACH_HOST", f"{prefix}cockroach")
+        cockroach_port = int(os.getenv("ORG_COCKROACH_SQL_PORT", "26257"))
+        cockroach_db = os.getenv("ORG_COCKROACH_DB", db_name)
+        cockroach_cert_dir = os.getenv("ORG_COCKROACH_CERT_CONTAINER_DIR", "/cockroach-certs")
+        cockroach_query = (
+            "sslmode=verify-full"
+            f"&sslrootcert={cockroach_cert_dir}/ca.crt"
+            f"&sslcert={cockroach_cert_dir}/client.root.crt"
+            f"&sslkey={cockroach_cert_dir}/client.root.key"
         )
-    )
-    cockroach_async = (
-        os.getenv("COCKROACH_ASYNC_URL")
-        or (
-            f"postgresql://{db_user}:{db_password}"
-            f"@{postgres_name}:{db_port}/{db_name}"
+        cockroach_sync = (
+            os.getenv("COCKROACH_DB_URL")
+            or f"cockroachdb://root@{cockroach_host}:{cockroach_port}/{cockroach_db}?{cockroach_query}"
         )
-    )
+        cockroach_async = (
+            os.getenv("COCKROACH_ASYNC_URL")
+            or f"postgresql://root@{cockroach_host}:{cockroach_port}/{cockroach_db}?{cockroach_query}"
+        )
+    else:
+        cockroach_sync = (
+            os.getenv("COCKROACH_DB_URL")
+            or (
+                f"postgresql+psycopg2://{db_user}:{db_password}"
+                f"@{postgres_name}:{db_port}/{db_name}"
+            )
+        )
+        cockroach_async = (
+            os.getenv("COCKROACH_ASYNC_URL")
+            or (
+                f"postgresql://{db_user}:{db_password}"
+                f"@{postgres_name}:{db_port}/{db_name}"
+            )
+        )
 
     default_native_origins = (
         os.getenv("ORG_NATIVE_ALLOWED_ORIGINS")
@@ -404,6 +426,14 @@ def run(prefix: str, network_name: str) -> None:
         "/var/lib/org/business-cards",
     )
     business_card_storage_volume = prefix + "ORG_BUSINESS_CARD_STORAGE"
+    use_cockroach = _env_truthy("ORG_USE_COCKROACH", default=False)
+    cockroach_cert_dir = Path(os.getenv("ORG_COCKROACH_CERT_DIR", str(DEFAULT_COCKROACH_CERT_DIR)))
+    cockroach_cert_mount = {
+        str(cockroach_cert_dir): {
+            "bind": os.getenv("ORG_COCKROACH_CERT_CONTAINER_DIR", "/cockroach-certs"),
+            "mode": "ro",
+        }
+    } if use_cockroach else {}
 
     env_base_prod = _common_env(prefix, postgres_name, redis_name, smtp_name, prod_frontend_host)
     env_base_dev = _common_env(prefix, postgres_name, redis_name, smtp_name, dev_frontend_host)
@@ -474,6 +504,7 @@ def run(prefix: str, network_name: str) -> None:
                 "bind": business_card_storage_dir,
                 "mode": "rw",
             },
+            **cockroach_cert_mount,
         },
         "environment": {
             **env_base_prod,
@@ -504,6 +535,7 @@ def run(prefix: str, network_name: str) -> None:
                 "bind": business_card_storage_dir,
                 "mode": "rw",
             },
+            **cockroach_cert_mount,
         },
         "environment": {
             **env_base_dev,
@@ -536,6 +568,7 @@ def run(prefix: str, network_name: str) -> None:
                 "bind": business_card_storage_dir,
                 "mode": "rw",
             },
+            **cockroach_cert_mount,
         },
         "environment": {
             **env_base_dev,
@@ -564,8 +597,9 @@ def run(prefix: str, network_name: str) -> None:
     prod["image"] = resolved_prod_image
     prod["environment"]["BACKEND_IMAGE_RUNNING"] = resolved_prod_image
 
-    docker_utils.run_container(postgres)
-    docker_utils.wait_for_db(network_name, db_url=f"{postgres_name}:5432", db_user=db_user)
+    if not use_cockroach:
+        docker_utils.run_container(postgres)
+        docker_utils.wait_for_db(network_name, db_url=f"{postgres_name}:5432", db_user=db_user)
     docker_utils.run_container(redis)
     docker_utils.wait_for_port(redis_name, 6379, network_name, retries=60, delay=2)
     if smtp_relay_enabled:
