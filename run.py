@@ -485,7 +485,7 @@ def run(prefix: str, network_name: str) -> None:
         "detach": True,
         "command": [
             "uvicorn",
-            "org:app",
+            "main:app",
             "--host",
             "0.0.0.0",
             "--port",
@@ -515,7 +515,7 @@ def run(prefix: str, network_name: str) -> None:
         "detach": True,
         "command": [
             "uvicorn",
-            "org:app",
+            "main:app",
             "--host",
             "0.0.0.0",
             "--port",

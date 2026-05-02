@@ -15,6 +15,7 @@ Use this flow when iterating locally and validating code changes.
 ### 1. Update code and dependencies
 - Change `org/*.py` and/or `org/requirements.txt`.
 - Keep MCP/FastAPI wiring in `org/org.py` so MCP remains in-process.
+- Runtime entrypoint is `main:app` (compatibility layer), which currently delegates to `org/org.py`.
 
 ### 2. Rebuild dev image when needed
 - `org/run.py` only builds the configured dev image tag if it does not exist.

@@ -10,4 +10,4 @@ COPY . /app
 ENV PYTHONPATH=/app
 
 EXPOSE 8001
-CMD ["uvicorn", "org:app", "--host", "0.0.0.0", "--port", "8001", "--reload", "--reload-dir", "/app"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--reload", "--reload-dir", "/app"]

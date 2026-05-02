@@ -4,3 +4,19 @@ __pycache__/
 .env.org
 .env.openai
 .env.resend
+
+# Certificates / private keys
+*.crt
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Generated artifacts
+build/
+dist/
+coverage/
+htmlcov/
+.pytest_cache/
+playwright-report/
+test-results/

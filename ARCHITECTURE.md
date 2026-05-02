@@ -12,7 +12,8 @@
 ## Runtime Topology
 
 ### Process model
-Single Python process running Uvicorn serves the FastAPI app (`org:app`) from `org/org.py`.
+Single Python process running Uvicorn serves the FastAPI app (`main:app`) from `org/main.py`.
+`main.py` currently delegates to the legacy monolith in `org/org.py` as a compatibility layer during refactor.
 
 ### Dependencies
 - PostgreSQL (configured via `COCKROACH_DB_URL` and `COCKROACH_ASYNC_URL`)
@@ -30,7 +31,8 @@ Single Python process running Uvicorn serves the FastAPI app (`org:app`) from `o
 ## Application Structure
 
 ### Composition
-- **Web app + models + API layer** live in `org/org.py`.
+- **Web app + models + API layer** currently live in `org/org.py` (being incrementally extracted).
+- **Compatibility app entrypoint** lives in `org/main.py`.
 - **Domain modules** live under `org/domain/`:
   - `auth.py`
   - `network.py`
