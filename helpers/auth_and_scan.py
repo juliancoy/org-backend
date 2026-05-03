@@ -4,6 +4,39 @@ for _name, _value in vars(_org).items():
         globals()[_name] = _value
 
 
+def _validate_public_url(url: Optional[str], field_name: str) -> Optional[str]:
+    if not url:
+        return None
+    cleaned = url.strip()
+    if not cleaned:
+        return None
+    try:
+        parsed = urlparse(cleaned)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be a valid URL")
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise HTTPException(status_code=422, detail=f"{field_name} must start with http:// or https://")
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        raise HTTPException(status_code=422, detail=f"{field_name} must include a hostname")
+    if hostname in {"localhost"} or hostname.endswith(".local"):
+        raise HTTPException(status_code=422, detail=f"{field_name} must use a public hostname")
+    try:
+        ip_value = ipaddress.ip_address(hostname)
+    except ValueError:
+        ip_value = None
+    if ip_value and (
+        ip_value.is_private
+        or ip_value.is_loopback
+        or ip_value.is_link_local
+        or ip_value.is_multicast
+        or ip_value.is_reserved
+        or ip_value.is_unspecified
+    ):
+        raise HTTPException(status_code=422, detail=f"{field_name} must use a public hostname")
+    return parsed._replace(fragment="").geturl()
+
+
 # ============= AUTHENTICATION =============
 
 def _is_sysadmin(current_user: dict) -> bool:
@@ -354,20 +387,25 @@ def _normalize_business_card_text(value: str) -> str:
 def _extract_business_card_fields(ocr_text: str) -> dict[str, Any]:
     text = _normalize_business_card_text(ocr_text)
     lines = text.splitlines()
+    content_lines = _scan_content_lines(lines)
+    person_section_lines = _scan_section_lines(lines, "person")
+    candidate_lines = person_section_lines or content_lines
     lowered = [line.lower() for line in lines]
 
     email_match = re.search(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", text, re.IGNORECASE)
     phone_match = re.search(r"(?:\+?\d[\d\-\(\)\s]{7,}\d)", text)
-    website_match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text, re.IGNORECASE)
+    candidate_text = "\n".join(candidate_lines) or text
+    website_match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", candidate_text, re.IGNORECASE)
 
-    likely_name = lines[0] if lines else None
+    likely_name = candidate_lines[0] if candidate_lines else None
     likely_company = None
     likely_title = None
     title_keywords = {
         "ceo", "cto", "cfo", "coo", "founder", "manager", "director", "lead", "engineer",
         "president", "partner", "owner", "consultant", "developer", "designer",
+        "agent", "licensed",
     }
-    for idx, line in enumerate(lines[1:5], start=1):
+    for idx, line in enumerate(candidate_lines[1:6], start=1):
         tokens = set(token.strip(",. ").lower() for token in line.split())
         if tokens & title_keywords and not likely_title:
             likely_title = line
@@ -397,6 +435,40 @@ def _extract_business_card_fields(ocr_text: str) -> dict[str, Any]:
         "address": address,
         "raw_lines": lines,
     }
+
+
+_SCAN_SECTION_LABELS = {"person", "people", "organization", "organisation", "org", "event", "events"}
+
+
+def _is_scan_section_label(value: str) -> bool:
+    normalized = re.sub(r"[^a-z]+", "", str(value or "").strip().lower())
+    return normalized in _SCAN_SECTION_LABELS
+
+
+def _scan_content_lines(lines: list[str]) -> list[str]:
+    return [line for line in lines if line.strip() and not _is_scan_section_label(line)]
+
+
+def _scan_section_lines(lines: list[str], section: str) -> list[str]:
+    wanted = section.strip().lower()
+    aliases = {
+        "person": {"person", "people"},
+        "organization": {"organization", "organisation", "org"},
+        "event": {"event", "events"},
+    }.get(wanted, {wanted})
+    collected: list[str] = []
+    in_section = False
+    for line in lines:
+        normalized = re.sub(r"[^a-z]+", "", str(line or "").strip().lower())
+        if normalized in _SCAN_SECTION_LABELS:
+            if normalized in aliases:
+                in_section = True
+                continue
+            if in_section:
+                break
+        elif in_section and line.strip():
+            collected.append(line.strip())
+    return collected
 
 
 def _coerce_public_url_candidate(value: Optional[str], field_name: str) -> Optional[str]:
@@ -631,7 +703,9 @@ def _extract_event_fields_from_text(ocr_text: str) -> dict[str, Any]:
 
 def _extract_events_from_text(ocr_text: str) -> list[dict[str, Any]]:
     text = _normalize_business_card_text(ocr_text)
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    event_section_lines = _scan_section_lines(raw_lines, "event")
+    lines = event_section_lines or _scan_content_lines(raw_lines)
     if not lines:
         return []
 
@@ -751,6 +825,11 @@ def _extract_events_from_text(ocr_text: str) -> list[dict[str, Any]]:
         if any(marker in lowered for marker in location_markers):
             location = line.split(":", 1)[-1].strip() if ":" in line else line
             break
+    eventish_text = "\n".join(lines).lower()
+    has_event_hint = any(token in eventish_text for token in ["event", "meetup", "conference", "workshop", "summit", "webinar", "tickets", "register"])
+    if not (starts_at or location or (event_section_lines and has_event_hint)):
+        return []
+
     description_lines = [line for line in lines[1:5] if line != location]
     description = "\n".join(description_lines).strip() or None
     if description and len(description) > 2000:
@@ -770,14 +849,26 @@ def _extract_events_from_text(ocr_text: str) -> list[dict[str, Any]]:
 
 def _extract_organization_fields_from_text(ocr_text: str) -> dict[str, Any]:
     text = _normalize_business_card_text(ocr_text)
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    organization_section_lines = _scan_section_lines(raw_lines, "organization")
+    lines = organization_section_lines or _scan_content_lines(raw_lines)
     if not lines:
         return {"name": None, "website": None, "description": None, "raw_lines": []}
 
-    website_match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text, re.IGNORECASE)
+    section_text = "\n".join(lines)
+    website_match = re.search(r"(https?://[^\s]+|www\.[^\s]+)", section_text or text, re.IGNORECASE)
     name = None
     org_tokens = ("inc", "llc", "ltd", "foundation", "association", "collective", "organization", "org", "corp", "company")
+    if organization_section_lines:
+        for line in organization_section_lines:
+            lowered = line.lower()
+            if re.search(r"(https?://|www\.)", lowered) or "@" in lowered:
+                continue
+            name = line
+            break
     for line in lines:
+        if name:
+            break
         lowered = line.lower()
         if re.search(r"(https?://|www\.)", lowered):
             continue
@@ -862,6 +953,52 @@ def _derive_org_payload_for_person_scan(
         "description": extracted_org.get("description"),
         "raw_lines": extracted_org.get("raw_lines") or extracted_person.get("raw_lines") or [],
     }
+
+
+def _find_org_by_source_url(session: Session, value: Optional[str]) -> Optional[Organization]:
+    url = _coerce_public_url_candidate(value, "source_url")
+    if not url:
+        return None
+    org = session.query(Organization).filter(Organization.source_url == url).first()
+    if org:
+        return org
+    return session.query(Organization).filter(Organization.source_urls.contains([url])).first()
+
+
+def _add_org_source_url(org: Organization, value: Optional[str]) -> None:
+    url = _coerce_public_url_candidate(value, "source_url")
+    if not url:
+        return
+    source_urls = list(org.source_urls or [])
+    if url not in source_urls:
+        source_urls.append(url)
+    org.source_urls = source_urls
+    if not org.source_url:
+        org.source_url = url
+
+
+def _slugify(value: str) -> str:
+    return slugify(value)
+
+
+def _ensure_unique_org_slug(session: Session, preferred: str) -> str:
+    base = _slugify(preferred) or "organization"
+    candidate = base
+    counter = 2
+    while session.query(Organization).filter(Organization.slug == candidate).first():
+        candidate = f"{base}-{counter}"
+        counter += 1
+    return candidate
+
+
+def _ensure_unique_event_slug(session: Session, preferred: str) -> str:
+    base = _slugify(preferred) or "event"
+    candidate = base
+    counter = 2
+    while session.query(NetworkEvent).filter(NetworkEvent.slug == candidate).first():
+        candidate = f"{base}-{counter}"
+        counter += 1
+    return candidate
 
 
 def _normalize_scan_kind(value: Optional[str]) -> str:
@@ -1174,5 +1311,3 @@ def _send_business_card_email_task(
         _record_business_card_email_outcome(submission_id=submission_id, sent=True, error_message=None)
     except Exception as exc:
         _record_business_card_email_outcome(submission_id=submission_id, sent=False, error_message=str(exc))
-
-

@@ -151,12 +151,17 @@ async def submit_business_card(
         0.0,
         min(1.0, float(runtime_settings.get("auto_min_margin", ORG_SCAN_AUTO_MIN_MARGIN))),
     )
+    high_confidence_scan_kinds = [
+        kind for kind, score in classification_scores.items() if float(score or 0.0) >= auto_min_confidence
+    ]
+    auto_multi_entity_detected = normalized_scan_kind == "auto" and len(high_confidence_scan_kinds) > 1
     clarification_required = False
     clarification_message: Optional[str] = None
     processing_status = "processed"
     if (
         normalized_scan_kind == "auto"
         and auto_clarification_enabled
+        and not auto_multi_entity_detected
         and (top_confidence < auto_min_confidence or confidence_margin < auto_min_margin)
     ):
         clarification_required = True
@@ -632,5 +637,3 @@ async def get_public_scan_image_for_created_target(
             "Cache-Control": "public, max-age=3600",
         },
     )
-
-

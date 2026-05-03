@@ -382,6 +382,10 @@ def _common_env(
             "ORG_BUSINESS_CARD_S3_USE_SSL",
             "false",
         ),
+        "ORG_BUSINESS_CARD_S3_SERVER_SIDE_ENCRYPTION": os.getenv(
+            "ORG_BUSINESS_CARD_S3_SERVER_SIDE_ENCRYPTION",
+            "",
+        ),
         "ORG_BUSINESS_CARD_S3_PREFIX": os.getenv(
             "ORG_BUSINESS_CARD_S3_PREFIX",
             "business-cards",
